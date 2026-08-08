@@ -30,11 +30,15 @@
 #include "wubu_rvc_f0.h"
 #include "wubu_rmvpe.h"
 #include "wubu_audioio.h"
+#include "wubu_autokey.h"
+#include "wubu_pitch.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <pthread.h>
+#include <omp.h>
 #include "wubu_postproc.h"
 
 static void die(const char *msg) { fprintf(stderr, "wubu_rvc_cli: %s\n", msg); exit(1); }
@@ -141,6 +145,93 @@ static float *upsample_frames(const float *in, int T, int dim, int *T2_out) {
     return out;
 }
 
+/* ── Chunked parallel synthesis ────────────────────────────────────────────
+ * The whole-track pipeline pays O(T^2) HuBERT attention, a whole-track flow,
+ * and multi-GB generator buffers on long audio (a 4:48 track hit 10.5 GB and
+ * 35+ min). Chunked inference processes independent 3 s windows (with extra
+ * HuBERT context) in parallel, then crossfades — RVC's own architecture.
+ * Workers grab chunks via an atomic counter; each sets its OpenMP thread
+ * count so N workers share the cores. */
+typedef struct {
+    const float *pcm16; int n16;
+    const int *f0_coarse; const float *nsff0; int n_f0;
+    const WuBuHubert *hb; int rvc_ver; int content_dim;
+    WuBuRVCModel *model; int speaker_id; float noise_scale; int use_snake;
+    int ups_total;
+    int chunk_16k, extra_16k, hop_16k;
+    int use_cuda;
+    int use_vk;
+    float **audio; int *pos; int *len; int *rc;
+    volatile int next; int n_chunks; int threads;
+} ChunkCtx;
+
+static void *chunk_worker(void *arg) {
+    ChunkCtx *ctx = (ChunkCtx *)arg;
+    omp_set_num_threads(ctx->threads > 0 ? ctx->threads : 1);
+    for (;;) {
+        int c = __sync_fetch_and_add(&ctx->next, 1);
+        if (c >= ctx->n_chunks) break;
+        int start = c * ctx->hop_16k;
+        int len_c = ctx->chunk_16k + ctx->extra_16k;
+        if (start + len_c > ctx->n16) len_c = ctx->n16 - start;
+        if (len_c < 4800) { ctx->rc[c] = 0; ctx->audio[c] = NULL; continue; }
+        int T_c = wubu_hubert_output_length(len_c);
+        if (T_c < 4) { ctx->rc[c] = 0; ctx->audio[c] = NULL; continue; }
+        float *content = (float *)malloc((size_t)T_c * ctx->content_dim * sizeof(float));
+        if (!content) { ctx->rc[c] = -1; continue; }
+        int got = wubu_hubert_extract_real(ctx->hb, ctx->pcm16 + start, len_c,
+                                           ctx->rvc_ver, content,
+                                           (size_t)T_c * ctx->content_dim);
+        if (got != T_c) { if (got < T_c) T_c = got; }
+        if (T_c < 4) { free(content); ctx->rc[c] = 0; ctx->audio[c] = NULL; continue; }
+        int T2_c = 0;
+        float *cup = upsample_frames(content, T_c, ctx->content_dim, &T2_c);
+        free(content);
+        if (!cup) { ctx->rc[c] = -1; continue; }
+        /* f0 slice for this chunk (100 fps: frame index = sample/160) */
+        int f0_start = start / 160;
+        int nf = T2_c;
+        if (f0_start + nf > ctx->n_f0) nf = ctx->n_f0 - f0_start;
+        if (nf < 4) { free(cup); ctx->rc[c] = 0; ctx->audio[c] = NULL; continue; }
+        /* transpose to col-major [dim, nf] */
+        float *cmaj = (float *)malloc((size_t)ctx->content_dim * nf * sizeof(float));
+        if (!cmaj) { free(cup); ctx->rc[c] = -1; continue; }
+        for (int j = 0; j < nf; j++)
+            for (int d = 0; d < ctx->content_dim; d++)
+                cmaj[(size_t)d * nf + j] = cup[(size_t)j * ctx->content_dim + d];
+        free(cup);
+        int max_a = nf * ctx->ups_total + ctx->ups_total;
+        float *aout = (float *)malloc((size_t)max_a * sizeof(float));
+        if (!aout) { free(cmaj); ctx->rc[c] = -1; continue; }
+        int n_out = 0;
+        if (ctx->use_vk)
+            n_out = wubu_rvc_synthesize_real_vk(ctx->model, cmaj, nf, ctx->content_dim,
+                                                ctx->f0_coarse + f0_start,
+                                                ctx->nsff0 + f0_start,
+                                                ctx->speaker_id, ctx->noise_scale,
+                                                aout, max_a, ctx->use_snake);
+        else if (ctx->use_cuda)
+            n_out = wubu_rvc_synthesize_real_cuda(ctx->model, cmaj, nf, ctx->content_dim,
+                                                  ctx->f0_coarse + f0_start,
+                                                  ctx->nsff0 + f0_start,
+                                                  ctx->speaker_id, ctx->noise_scale,
+                                                  aout, max_a, ctx->use_snake);
+        else
+            n_out = wubu_rvc_synthesize_real(ctx->model, cmaj, nf, ctx->content_dim,
+                                             ctx->f0_coarse + f0_start,
+                                             ctx->nsff0 + f0_start,
+                                             ctx->speaker_id, ctx->noise_scale,
+                                             aout, max_a, ctx->use_snake);
+        free(cmaj);
+        if (n_out <= 0) { free(aout); ctx->rc[c] = -1; continue; }
+        ctx->audio[c] = aout;
+        ctx->pos[c] = f0_start * ctx->ups_total;
+        ctx->len[c] = n_out;
+        ctx->rc[c] = 0;
+    }
+    return NULL;
+}
+
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0); /* crash-safe stage logging */
     setvbuf(stderr, NULL, _IONBF, 0);
@@ -177,8 +268,15 @@ int main(int argc, char **argv) {
     int force_yin = 0;        /* --f0 yin: force YIN instead of RMVPE */
     int f0_filter_radius = 3; /* --f0filter N: median filter on f0 (0 = off) */
     float rms_mix = 0.25f;    /* --rmsmix F: output follows input volume envelope (RVC default 0.25) */
+    int autokey_probe = 0;    /* --autokey N: auto key adaptation (N = probe secs) */
+    float chunk_secs = 3.0f;  /* --chunk F: chunked inference (3s default; 0 = whole-track) */
+    int jobs = 4;             /* --jobs N: parallel chunk workers (sweet spot measured) */
+    int no_chunk = 0;         /* --no-chunk: force the whole-track path (parity) */
+    int use_cuda = 0;         /* --cuda: run the GeneratorNSF on the GPU (CUDA) */
+    int use_vk = 0;           /* --vk: run the GeneratorNSF via Vulkan (cross-vendor) */
+    float autokey_shift = 0.0f; /* chosen feed shift (semitones), applied + restored */
     snprintf(model_path, sizeof(model_path), "%s/model.pth", model_dir);
-    for (int a = 4; a < argc - 1; a++) {
+    for (int a = 4; a < argc; a++) {
         if (strcmp(argv[a], "--model") == 0) {
             snprintf(model_path, sizeof(model_path), "%s", argv[a + 1]);
             a++;
@@ -217,6 +315,25 @@ int main(int argc, char **argv) {
             if (rms_mix < 0.0f) rms_mix = 0.0f;
             if (rms_mix > 1.0f) rms_mix = 1.0f;
             a++;
+        } else if (strcmp(argv[a], "--autokey") == 0) {
+            autokey_probe = atoi(argv[a + 1]);
+            if (autokey_probe < 0) autokey_probe = 0;
+            a++;
+        } else if (strcmp(argv[a], "--chunk") == 0) {
+            chunk_secs = (float)atof(argv[a + 1]);
+            if (chunk_secs < 0.5f) chunk_secs = 0.5f;
+            a++;
+        } else if (strcmp(argv[a], "--jobs") == 0) {
+            jobs = atoi(argv[a + 1]);
+            if (jobs < 1) jobs = 1;
+            if (jobs > 8) jobs = 8;
+            a++;
+        } else if (strcmp(argv[a], "--no-chunk") == 0) {
+            no_chunk = 1;
+        } else if (strcmp(argv[a], "--cuda") == 0) {
+            use_cuda = 1;
+        } else if (strcmp(argv[a], "--vk") == 0) {
+            use_vk = 1;
         }
     }
     if (!strstr(model_path, ".pth")) {
@@ -225,6 +342,8 @@ int main(int argc, char **argv) {
         /* use the C loader's own dir scan via wubu_rvc_load_weights later;
          * here just try common names */
     }
+    int use_chunk = (chunk_secs > 0.5f && !no_chunk);
+    clock_t t0 = 0;
     FILE *chk = fopen(model_path, "rb");
     if (!chk) die("cannot open model.pth — pass --model");
     fclose(chk);
@@ -305,20 +424,23 @@ int main(int argc, char **argv) {
     if (wubu_hubert_load(&hb, hubert_bin) != 0)
         die("hubbert weights missing — run tools/extract_hubert_weights.py or pass --hubert PATH");
     int T = wubu_hubert_output_length(n16);
-    printf("[3] hubert frames: %d\n", T);
-    float *content = (float *)malloc((size_t)T * content_dim * sizeof(float));
-    clock_t t0 = clock();
-    int Tc = wubu_hubert_extract_real(&hb, pcm16, n16, rvc_ver, content, T * content_dim);
-    printf("     hubert: %.2f s (%.2fx realtime)\n",
-           (double)(clock() - t0) / CLOCKS_PER_SEC,
-           (double)(clock() - t0) / CLOCKS_PER_SEC / ((double)n16 / 16000.0));
-    if (Tc != T) { printf("     (hubert returned %d frames)\n", Tc); T = Tc; }
-
-    /* 4. content ×2 upsample: [T, dim] -> [2T, dim] */
     int T2 = 0;
-    float *content_up = upsample_frames(content, T, content_dim, &T2);
-    free(content);
-    printf("[4] content_up frames: %d\n", T2);
+    float *content_up = NULL;
+    if (!use_chunk) {
+        printf("[3] hubert frames: %d\n", T);
+        float *content = (float *)malloc((size_t)T * content_dim * sizeof(float));
+        t0 = clock();
+        int Tc = wubu_hubert_extract_real(&hb, pcm16, n16, rvc_ver, content, T * content_dim);
+        printf("     hubert: %.2f s (%.2fx realtime)\n",
+               (double)(clock() - t0) / CLOCKS_PER_SEC,
+               (double)(clock() - t0) / CLOCKS_PER_SEC / ((double)n16 / 16000.0));
+        if (Tc != T) { printf("     (hubert returned %d frames)\n", Tc); T = Tc; }
+
+        /* 4. content ×2 upsample: [T, dim] -> [2T, dim] */
+        content_up = upsample_frames(content, T, content_dim, &T2);
+        free(content);
+        printf("[4] content_up frames: %d\n", T2);
+    }
 
     /* 5. f0 (YIN at 16k, 100 fps) + coarse. RVC consumes f0 at the SAME
      * frame rate as the ×2 content (100 fps: 278 frames for 2.78 s) — NO ×2
@@ -384,14 +506,135 @@ int main(int argc, char **argv) {
         wubu_f0_to_coarse(f0, n_f0, 50.0f, 1100.0f, f0_coarse, nsff0);
         n_f0_2 = n_f0;
     }
+
+    /* 5b. auto key adaptation — feed the model an f0 in its conditioned
+     * range, then restore the output to the input's key (phase vocoder). */
+    if (autokey_probe > 0 && n_f0_2 > 0) {
+        float cached_mean = 0, cached_drift = 0;
+        float cached_shift = wubu_autokey_load(model_dir, &cached_mean, &cached_drift);
+        float in_mean = wubu_autokey_input_mean(nsff0, n_f0_2);
+        if (cached_shift != 0.0f && cached_mean > 0 &&
+            fabsf(12.0f * log2f(in_mean / cached_mean)) < 3.0f) {
+            autokey_shift = cached_shift;
+            printf("[5b] autokey cached shift %+.1f st (input mean %.0f Hz)\n",
+                   autokey_shift, in_mean);
+        } else {
+            WuBuRmvpe *rm2 = wubu_rmvpe_load("models/rvc/rmvpe_weights.bin");
+            if (rm2) {
+                float drift = 0;
+                autokey_shift = wubu_autokey_calibrate(
+                    rvc->model, &hb, rm2, pcm16, n16, nsff0, n_f0_2,
+                    content_dim, sr_out, ups_total, noise_scale, 0 /*snake*/,
+                    autokey_probe, &drift);
+                wubu_rmvpe_free(rm2);
+                if (fabsf(autokey_shift) > 0.01f || fabsf(drift) > 30.0f)
+                    wubu_autokey_save(model_dir, autokey_shift, in_mean, drift);
+            }
+        }
+        if (fabsf(autokey_shift) > 0.01f) {
+            float gain = powf(2.0f, autokey_shift / 12.0f);
+            for (int i = 0; i < n_f0_2; i++) nsff0[i] *= gain;
+            wubu_f0_to_coarse(nsff0, n_f0_2, 50.0f, 1100.0f, f0_coarse, nsff0);
+            printf("[5b] autokey: feeding f0 %+.1f st (will restore output)\n",
+                   autokey_shift);
+        }
+    }
     free(f0);
 
     /* 6. real synth */
-    printf("[6] synth...\n");
-    int n_frames = T2 < n_f0_2 ? T2 : n_f0_2;
-    int max_audio = n_frames * ups_total;
-    float *out_audio = (float *)malloc((size_t)max_audio * sizeof(float));
-    if (!out_audio) die("alloc");
+    float *out_audio = NULL;
+    int n_out = 0;
+    double synth_s = 0.0;
+    if (use_chunk) {
+        /* 6b. chunked + parallel synthesis (default) */
+        const int chunk_16k = (int)(chunk_secs * 16000);
+        const int extra_16k = 11520;                 /* 0.72 s HuBERT context */
+        const int xfade_16k = (int)(0.10f * 16000);  /* 0.1 s crossfade */
+        const int hop_16k = chunk_16k - xfade_16k;
+        if (hop_16k < 16000) die("--chunk too small");
+        int n_chunks = 0;
+        for (long s = 0; s < n16; s += hop_16k) n_chunks++;
+        long total_out = ((long)(n16 / 160) + 2) * ups_total;
+        out_audio = (float *)calloc((size_t)total_out, sizeof(float));
+        if (!out_audio) die("alloc");
+        float **caudio = (float **)calloc((size_t)n_chunks, sizeof(float *));
+        int *cpos = (int *)calloc((size_t)n_chunks, sizeof(int));
+        int *clen = (int *)calloc((size_t)n_chunks, sizeof(int));
+        int *crc = (int *)calloc((size_t)n_chunks, sizeof(int));
+        if (!caudio || !cpos || !clen || !crc) die("alloc");
+        ChunkCtx ctx;
+        memset(&ctx, 0, sizeof(ctx));
+        ctx.pcm16 = pcm16; ctx.n16 = n16;
+        ctx.f0_coarse = f0_coarse; ctx.nsff0 = nsff0; ctx.n_f0 = n_f0_2;
+        ctx.hb = &hb; ctx.rvc_ver = rvc_ver; ctx.content_dim = content_dim;
+        ctx.model = rvc->model; ctx.speaker_id = speaker_id;
+        ctx.noise_scale = noise_scale; ctx.use_snake = use_snake;
+        ctx.use_cuda = use_cuda;
+        ctx.use_vk = use_vk;
+        ctx.ups_total = ups_total;
+        ctx.chunk_16k = chunk_16k; ctx.extra_16k = extra_16k; ctx.hop_16k = hop_16k;
+        ctx.audio = caudio; ctx.pos = cpos; ctx.len = clen; ctx.rc = crc;
+        ctx.n_chunks = n_chunks; ctx.threads = (jobs > 0) ? (8 / jobs) : 8;
+        if (ctx.threads < 1) ctx.threads = 1;
+        clock_t t0 = clock();
+        pthread_t *th = (pthread_t *)malloc((size_t)jobs * sizeof(pthread_t));
+        if (!th) die("alloc");
+        for (int w = 0; w < jobs; w++)
+            pthread_create(&th[w], NULL, chunk_worker, &ctx);
+        for (int w = 0; w < jobs; w++)
+            pthread_join(th[w], NULL);
+        free(th);
+        /* sequential OLA with 0.1 s crossfade */
+        int valid_out = (chunk_16k / 160) * ups_total;   /* 3.0 s valid audio */
+        int xf_out = (xfade_16k / 160) * ups_total;      /* 0.1 s crossfade */
+        for (int c = 0; c < n_chunks; c++) {
+            if (!caudio[c] || crc[c] != 0) continue;
+            long p0 = cpos[c];
+            int len = clen[c];
+            float *a = caudio[c];
+            int valid = valid_out;
+            if (valid > len) valid = len;
+            int xf = xf_out;
+            if (xf > valid) xf = valid;
+            /* fade-in head (if this chunk overlaps a previous tail) */
+            if (p0 > 0) {
+                for (int i = 0; i < xf && p0 + i < total_out; i++) {
+                    float f = (float)i / xf;
+                    out_audio[p0 + i] += a[i] * f;
+                }
+            }
+            /* main body */
+            for (int i = xf; i < valid - xf && p0 + i < total_out; i++)
+                out_audio[p0 + i] += a[i];
+            /* fade-out tail */
+            for (int i = valid - xf; i < valid && p0 + i < total_out; i++) {
+                float f = (float)(valid - i) / xf;
+                out_audio[p0 + i] += a[i] * f;
+            }
+            /* if this is the last chunk, the extra tail audio is the outro —
+             * copy the rest past the valid window (fade to silence) */
+            if (c == n_chunks - 1) {
+                for (int i = valid; i < len && p0 + i < total_out; i++) {
+                    float f = 1.0f - (float)(i - valid) / (float)(xf + 1);
+                    if (f < 0.0f) f = 0.0f;
+                    out_audio[p0 + i] += a[i] * f;
+                }
+            }
+            free(a);
+            caudio[c] = NULL;
+        }
+        synth_s = (double)(clock() - t0) / CLOCKS_PER_SEC;
+        n_out = (int)(((long)(n16 / 160)) * ups_total);
+        if (n_out > total_out) n_out = (int)total_out;
+        printf("[6] chunked synth: %d chunks x %d workers, %.2f s (%.2fx realtime)\n",
+               n_chunks, jobs, synth_s, synth_s / ((double)n_out / sr_out));
+        free(caudio); free(cpos); free(clen); free(crc);
+    } else {
+        printf("[6] synth...\n");
+        int n_frames = T2 < n_f0_2 ? T2 : n_f0_2;
+        int max_audio = n_frames * ups_total;
+        out_audio = (float *)malloc((size_t)max_audio * sizeof(float));
+        if (!out_audio) die("alloc");
 
     if (getenv("WUBU_RVC_DUMP")) {
         /* debug: dump the exact synth inputs for parity comparison */
@@ -414,10 +657,10 @@ int main(int argc, char **argv) {
     free(content_up);
 
     t0 = clock();
-    int n_out = wubu_rvc_synthesize_real(rvc->model, cmaj, n_frames, content_dim,
-                                         f0_coarse, nsff0, speaker_id, noise_scale,
-                                         out_audio, max_audio, use_snake);
-    double synth_s = (double)(clock() - t0) / CLOCKS_PER_SEC;
+    n_out = wubu_rvc_synthesize_real(rvc->model, cmaj, n_frames, content_dim,
+                                     f0_coarse, nsff0, speaker_id, noise_scale,
+                                     out_audio, max_audio, use_snake);
+    synth_s = (double)(clock() - t0) / CLOCKS_PER_SEC;
     if (n_out <= 0) die("synth failed");
 
     /* Snake safety (2026-08-07): pretrained RVC weights were trained with
@@ -443,6 +686,7 @@ int main(int argc, char **argv) {
     }
     printf("     synth: %.2f s (%.2fx realtime)\n", synth_s,
            synth_s / ((double)n_out / sr_out));
+    }
 
     /* 6. post-processing: normalize then apply character preset */
     if (preset > 0 && preset <= 4) {
@@ -516,12 +760,24 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* Auto-key restore: the model was fed a shifted f0; pitch-shift the
+     * output back so the voice lands in the input's key. */
+    if (fabsf(autokey_shift) > 0.01f) {
+        float *restored = (float *)malloc((size_t)n_out * sizeof(float));
+        if (restored) {
+            wubu_pitch_shift(out_audio, n_out, sr_out, -autokey_shift, restored);
+            memcpy(out_audio, restored, (size_t)n_out * sizeof(float));
+            printf("     [autokey] restored output by %+.1f st\n", -autokey_shift);
+            free(restored);
+        }
+    }
+
     /* 6. write wav */
     if (write_wav(out_path, out_audio, n_out, sr_out) != 0) die("write wav failed");
     printf("[6] wrote %s: %d samples @%d (%.2f s)\n", out_path, n_out, sr_out,
            (double)n_out / sr_out);
 
-    free(pcm16); free(f0_coarse); free(nsff0); free(out_audio); free(cmaj);
+    free(pcm16); free(f0_coarse); free(nsff0); free(out_audio);
     free(audio);
     wubu_hubert_free(&hb);
     wubu_rvc_destroy(rvc);

@@ -1,0 +1,40 @@
+#version 450
+layout(local_size_x = 128, local_size_y = 4) in;
+
+layout(set = 0, binding = 0) buffer InBuf  { float in_f[]; };   /* [in_ch * n] */
+layout(set = 0, binding = 1) buffer WBuf   { float w_f[]; };    /* [in_ch * out_ch * k] (ConvTranspose1d weight) */
+layout(set = 0, binding = 2) buffer BBuf   { float b_f[]; };    /* [out_ch] */
+layout(set = 0, binding = 3) buffer OutBuf { float out_f[]; };  /* [out_ch * n_out] */
+
+layout(push_constant) uniform PC {
+    int in_ch;
+    int n;
+    int out_ch;
+    int k;
+    int stride;
+    int pad;
+    int dil;
+    int n_out;
+} pc;
+
+/* ConvTranspose1d (gather form), same accumulation order as the CPU scatter:
+ * for output (oc, j): for ic: for i (increasing): tap = j + pad - i*stride. */
+void main() {
+    int j  = int(gl_GlobalInvocationID.x);
+    int oc = int(gl_GlobalInvocationID.y);
+    if (j >= pc.n_out || oc >= pc.out_ch) return;
+    float acc = b_f[oc];
+    int i_lo = (j + pc.pad - (pc.k - 1) + pc.stride - 1) / pc.stride;
+    if (i_lo < 0) i_lo = 0;
+    int i_hi = (j + pc.pad) / pc.stride;
+    if (i_hi >= pc.n) i_hi = pc.n - 1;
+    for (int ic = 0; ic < pc.in_ch; ic++) {
+        int base = ic * pc.n;
+        int wb   = (ic * pc.out_ch + oc) * pc.k;
+        for (int i = i_lo; i <= i_hi; i++) {
+            int tap = j + pc.pad - i * pc.stride;
+            if (tap >= 0 && tap < pc.k) acc += in_f[base + i] * w_f[wb + tap];
+        }
+    }
+    out_f[oc * pc.n_out + j] = acc;
+}

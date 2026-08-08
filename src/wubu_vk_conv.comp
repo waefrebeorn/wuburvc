@@ -1,0 +1,36 @@
+#version 450
+layout(local_size_x = 128, local_size_y = 4) in;
+
+layout(set = 0, binding = 0) buffer InBuf  { float in_f[]; };   /* [in_ch * n] */
+layout(set = 0, binding = 1) buffer WBuf   { float w_f[]; };    /* [out_ch * in_ch * k] */
+layout(set = 0, binding = 2) buffer BBuf   { float b_f[]; };    /* [out_ch] */
+layout(set = 0, binding = 3) buffer OutBuf { float out_f[]; };  /* [out_ch * n_out] */
+
+layout(push_constant) uniform PC {
+    int in_ch;
+    int n;
+    int out_ch;
+    int k;
+    int stride;
+    int pad;
+    int dil;
+    int n_out;
+} pc;
+
+/* conv1d, same math as wubu_rvc_cuda.cu k_conv1d / wubu_rvc_real.c conv1d_c */
+void main() {
+    int j  = int(gl_GlobalInvocationID.x);
+    int oc = int(gl_GlobalInvocationID.y);
+    if (j >= pc.n_out || oc >= pc.out_ch) return;
+    float acc = b_f[oc];
+    for (int ic = 0; ic < pc.in_ch; ic++) {
+        int base = ic * pc.n;
+        int wb   = (oc * pc.in_ch + ic) * pc.k;
+        for (int tap = 0; tap < pc.k; tap++) {
+            int src = j * pc.stride + tap * pc.dil - pc.pad;
+            if (src >= 0 && src < pc.n)
+                acc += in_f[base + src] * w_f[wb + tap];
+        }
+    }
+    out_f[oc * pc.n_out + j] = acc;
+}

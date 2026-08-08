@@ -54,6 +54,30 @@ int wubu_rvc_synthesize_real(WuBuRVCModel *model,
                              float *out_audio, int max_samples,
                              int use_snake);
 
+/* GPU generator variant (wubu_rvc_cuda.cu): flow on CPU, GeneratorNSF on CUDA. */
+int wubu_rvc_synthesize_real_cuda(WuBuRVCModel *model,
+                                  const float *content, int n_frames, int content_dim,
+                                  const int *f0_coarse, const float *nsff0,
+                                  int sid, float randn_scale,
+                                  float *out_audio, int max_samples,
+                                  int use_snake);
+
+/* Vulkan generator variant (wubu_vk.c): flow on CPU, GeneratorNSF via
+ * Vulkan compute shaders (cross-vendor — NVIDIA/AMD/Intel). */
+int wubu_rvc_synthesize_real_vk(WuBuRVCModel *model,
+                                const float *content, int n_frames, int content_dim,
+                                const int *f0_coarse, const float *nsff0,
+                                int sid, float randn_scale,
+                                float *out_audio, int max_samples,
+                                int use_snake);
+
+/* CUDA GeneratorNSF (defined in wubu_rvc_cuda.cu). */
+int wubu_generator_nsf_cuda(WuBuRVCModel *model,
+                            const float *z, int nF, int inter_channels,
+                            const float *nsff0, const float *g,
+                            float *out_audio, int max_samples,
+                            int inject_noise, int use_snake);
+
 /* ── TextEncoder768 / TextEncoder256 (enc_p) ──
  * Returns 0 on success. m/logs are [n_frames * inter_channels] each. */
 int wubu_enc_p_forward(WuBuRVCModel *model,

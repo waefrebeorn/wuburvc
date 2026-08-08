@@ -8,6 +8,7 @@
  */
 #define _USE_MATH_DEFINES
 #include "wubu_stft.h"
+#include "wubu_fft.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -29,31 +30,19 @@ WuBuStft *wubu_stft_create(int n_fft, int hop) {
     s->hop = hop;
     s->n_bins = n_fft / 2 + 1;
     s->window = (float *)malloc((size_t)n_fft * sizeof(float));
-    s->cos_tab = (float *)malloc((size_t)s->n_bins * n_fft * sizeof(float));
-    s->sin_tab = (float *)malloc((size_t)s->n_bins * n_fft * sizeof(float));
-    if (!s->window || !s->cos_tab || !s->sin_tab) {
+    if (!s->window) {
         wubu_stft_free(s);
         return NULL;
     }
     /* torch.hann_window = periodic Hann: 0.5*(1 - cos(2*pi*n/N)) */
     for (int i = 0; i < n_fft; i++)
         s->window[i] = 0.5f - 0.5f * cosf(2.0f * (float)M_PI * (float)i / (float)n_fft);
-    /* precompute DFT basis: exp(-j*2*pi*b*t/n) for b in [0, n_bins) */
-    for (int b = 0; b < s->n_bins; b++) {
-        for (int t = 0; t < n_fft; t++) {
-            float ph = -2.0f * (float)M_PI * (float)b * (float)t / (float)n_fft;
-            s->cos_tab[(size_t)b * n_fft + t] = cosf(ph);
-            s->sin_tab[(size_t)b * n_fft + t] = sinf(ph);
-        }
-    }
     return s;
 }
 
 void wubu_stft_free(WuBuStft *s) {
     if (!s) return;
     free(s->window);
-    free(s->cos_tab);
-    free(s->sin_tab);
     free(s);
 }
 
@@ -80,20 +69,21 @@ int wubu_stft_magnitude(const WuBuStft *s, const float *pcm, int n_samples,
 
     const int n_fft = s->n_fft;
     const int n_bins = s->n_bins;
+    WuBuCpx *spec = (WuBuCpx *)malloc((size_t)n_fft * sizeof(WuBuCpx));
+    if (!spec) { free(buf); return -1; }
     for (int f = 0; f < T; f++) {
         const float *x = buf + (size_t)f * s->hop;
+        for (int t = 0; t < n_fft; t++) {
+            spec[t].re = x[t] * s->window[t];
+            spec[t].im = 0.0f;
+        }
+        wubu_fft(spec, n_fft, 0);
         for (int b = 0; b < n_bins; b++) {
-            float re = 0.0f, im = 0.0f;
-            const float *ct = s->cos_tab + (size_t)b * n_fft;
-            const float *st = s->sin_tab + (size_t)b * n_fft;
-            for (int t = 0; t < n_fft; t++) {
-                float v = x[t] * s->window[t];
-                re += v * ct[t];
-                im += v * st[t];
-            }
+            float re = spec[b].re, im = spec[b].im;
             mag_out[(size_t)b * T + f] = sqrtf(re * re + im * im);
         }
     }
+    free(spec);
     free(buf);
     return T;
 }
@@ -101,6 +91,8 @@ int wubu_stft_magnitude(const WuBuStft *s, const float *pcm, int n_samples,
 void wubu_mel_apply(const float *basis, int n_mels, int n_bins,
                     const float *mag, int T, float *mel_out) {
     if (!basis || !mag || !mel_out) return;
+    /* each mel row is an independent dot product — parallel over rows */
+#pragma omp parallel for schedule(static) if(n_mels >= 4)
     for (int m = 0; m < n_mels; m++) {
         const float *brow = basis + (size_t)m * n_bins;
         float *mrow = mel_out + (size_t)m * T;

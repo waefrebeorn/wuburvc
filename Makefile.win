@@ -12,7 +12,7 @@ export TMPDIR := $(TMP)
 RVC_SRCS = src/wubu_rvc.c src/wubu_rvc_parity.c src/wubu_rvc_weights.c \
            src/wubu_rvc_kernels_exact.c src/wubu_rvc_real.c src/wubu_rvc_hubert.c \
            src/wubu_rvc_f0.c src/wubu_postproc.c src/wubu_rmvpe.c \
-           src/wubu_stft.c src/wubu_gru.c src/wubu_audioio.c \n           src/wubu_pitch.c src/wubu_autokey.c
+           src/wubu_stft.c src/wubu_gru.c src/wubu_audioio.c \n           src/wubu_pitch.c src/wubu_autokey.c src/wubu_fft.c
 
 all: build/wubu_rvc build/test_rmvpe build/test_master build/wubu_mixmaster
 

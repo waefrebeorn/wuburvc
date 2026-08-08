@@ -178,8 +178,8 @@ static void rec_sync(WuBuVk *vk) {
 /* per-op flush: submit + wait + re-begin after each recorded dispatch.
  * (A single multi-dispatch buffer with memory barriers does NOT produce
  * correct results on this NVIDIA driver — empirically the submit boundary
- * plus a host-side read of the pool memory is the only reliable sync. Each
- * flush is ~0.1ms; the generator runs ~240 dispatches per chunk.) */
+ * is the only reliable sync. Each flush is ~0.1ms; the generator runs
+ * ~240 dispatches per chunk; the barrier-only path is future work.) */
 static void rec_flush(WuBuVk *vk) {
     vkEndCommandBuffer(vk->cb);
     VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1,

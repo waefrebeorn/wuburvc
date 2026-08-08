@@ -18,6 +18,7 @@
  * License: WaefreBeorn-UMV3
  */
 #include "wubu_pitch.h"
+#include "wubu_fft.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -30,37 +31,7 @@
 #define PV_H 512
 #define PV_BINS (PV_N / 2 + 1)
 
-typedef struct {
-    float re, im;
-} Cpx;
-
-static void cfft(Cpx *a, int n, int inv) {
-    /* iterative radix-2 FFT (Cooley-Tukey, bit-reversal) */
-    for (int i = 1, j = 0; i < n; i++) {
-        int bit = n >> 1;
-        for (; j & bit; bit >>= 1) j ^= bit;
-        j ^= bit;
-        if (i < j) { Cpx t = a[i]; a[i] = a[j]; a[j] = t; }
-    }
-    for (int len = 2; len <= n; len <<= 1) {
-        double ang = 2.0 * M_PI / len * (inv ? -1.0 : 1.0);
-        Cpx wl = { (float)cos(ang), (float)sin(ang) };
-        for (int i = 0; i < n; i += len) {
-            Cpx w = { 1.0f, 0.0f };
-            for (int j = 0; j < len / 2; j++) {
-                Cpx u = a[i + j];
-                Cpx v = { a[i + j + len / 2].re * w.re - a[i + j + len / 2].im * w.im,
-                          a[i + j + len / 2].re * w.im + a[i + j + len / 2].im * w.re };
-                a[i + j] = (Cpx){ u.re + v.re, u.im + v.im };
-                a[i + j + len / 2] = (Cpx){ u.re - v.re, u.im - v.im };
-                Cpx nw = { w.re * wl.re - w.im * wl.im, w.re * wl.im + w.im * wl.re };
-                w = nw;
-            }
-        }
-    }
-    if (inv)
-        for (int i = 0; i < n; i++) { a[i].re /= n; a[i].im /= n; }
-}
+typedef WuBuCpx Cpx;
 
 static float princarg(float p) {
     while (p > (float)M_PI) p -= 2.0f * (float)M_PI;
@@ -107,7 +78,7 @@ int wubu_pitch_shift(const float *in, int n, int sr, float semitones,
             float v = (m * H + k < n) ? xf[k] * win[k] : 0.0f;
             X[k].re = v; X[k].im = 0.0f;
         }
-        cfft(X, N, 0);
+        wubu_fft(X, N, 0);
 
         memset(Y, 0, (size_t)N * sizeof(Cpx));
         memset(taken, 0, (size_t)PV_BINS * sizeof(int));
@@ -145,7 +116,7 @@ int wubu_pitch_shift(const float *in, int n, int sr, float semitones,
             Y[N - kd].re = Y[kd].re;
             Y[N - kd].im = -Y[kd].im;
         }
-        cfft(Y, N, 1);
+        wubu_fft(Y, N, 1);
 
         /* overlap-add with the same hann (synthesis window = analysis) */
         int base = m * H;

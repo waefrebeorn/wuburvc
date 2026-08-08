@@ -637,7 +637,7 @@ int wubu_rvc_synthesize_full(WuBuRVCModel *model,
     /* 1. Top-k retrieval (if index loaded) — REAL FAISS search against the
      * training-set vectors. No self-blend: if no index is loaded, retrieval
      * is skipped entirely (ratio 0), never the query blended with itself. */
-    int k = 4;
+    int k = 1; /* only the top-1 neighbor is used by the blend below */
     int *retrieved_idx = (int *)calloc((size_t)k * n_frames, sizeof(int));
     float *retrieved_dist = (float *)calloc((size_t)k * n_frames, sizeof(float));
     int have_retrieval = 0;
@@ -647,13 +647,18 @@ int wubu_rvc_synthesize_full(WuBuRVCModel *model,
         fake_idx.d = model->index_dim > 0 ? model->index_dim : content_dim;
         fake_idx.nb = model->n_index_vectors;
         fake_idx.vectors = model->retrieval_vectors;
+        /* each frame's search is independent — parallel over frames (the
+         * brute-force scan is the dominant cost on long audio) */
+        int found = 0;
+#pragma omp parallel for schedule(static) if(n_frames >= 32) reduction(+:found)
         for (int f = 0; f < n_frames; f++) {
             if (wubu_faiss_search(&fake_idx, &content_feats[(size_t)f * content_dim],
                                   fake_idx.d, k,
                                   &retrieved_idx[(size_t)f * k],
                                   &retrieved_dist[(size_t)f * k]) == 0)
-                have_retrieval = 1;
+                found++;
         }
+        have_retrieval = found > 0;
     }
 
     /* 2. Blend content with retrieved (retrieval ratio = 0.78).

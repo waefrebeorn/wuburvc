@@ -60,7 +60,28 @@ float wubu_autokey_calibrate(WuBuRVCModel *model, WuBuHubert *hb,
     if (probe_frames > n_f0) probe_frames = n_f0;
     if (probe_frames < 200) return 0.0f;
 
-    double in_mean = voiced_mean(f0_hz, probe_frames);
+    /* pick a VOICED window for the probe — the start of the file is often
+     * an instrumental intro with no f0 (an all-unvoiced probe calibrates
+     * nothing). Scan for the first stretch with >30% voicing. */
+    int start_frame = 0;
+    {
+        int best = -1, best_vc = 0;
+        for (int i = 0; i + probe_frames <= n_f0; i += probe_frames / 2) {
+            int vc = 0;
+            for (int j = i; j < i + probe_frames; j++)
+                if (f0_hz[j] > 0) vc++;
+            if (vc > best_vc) { best_vc = vc; best = i; }
+            if (vc > probe_frames * 0.4) break; /* good enough */
+        }
+        if (best >= 0 && best_vc > probe_frames / 5) start_frame = best;
+    }
+    const float *probe_pcm = pcm16 + (size_t)start_frame * 160;
+    const float *probe_f0 = f0_hz + start_frame;
+    if (start_frame > 0)
+        fprintf(stderr, "[autokey] probe window starts at frame %d (%.1f s)\n",
+                start_frame, (double)start_frame / 100.0);
+
+    double in_mean = voiced_mean(probe_f0, probe_frames);
     /* candidates: 0 first, then the octave that lifts a low input into the
      * model's conditioned range (or drops a very high input) */
     float cands[3]; int nc = 1; cands[0] = 0.0f;
@@ -80,14 +101,14 @@ float wubu_autokey_calibrate(WuBuRVCModel *model, WuBuHubert *hb,
         int *pcoarse = (int *)malloc((size_t)(probe_frames + 2) * sizeof(int));
         float *pnsf = (float *)malloc((size_t)(probe_frames + 2) * sizeof(float));
         if (!pf0 || !pcoarse || !pnsf) { free(pf0); free(pcoarse); free(pnsf); break; }
-        for (int i = 0; i < probe_frames; i++) pf0[i] = f0_hz[i] * gain;
+        for (int i = 0; i < probe_frames; i++) pf0[i] = probe_f0[i] * gain;
         wubu_f0_to_coarse(pf0, probe_frames, 50.0f, 1100.0f, pcoarse, pnsf);
 
         /* content for the probe */
         int pT = 0, maxT = probe_n16 / 320 + 8;
         float *content = (float *)malloc((size_t)maxT * content_dim * sizeof(float));
         if (!content) { free(pf0); free(pcoarse); free(pnsf); break; }
-        pT = wubu_hubert_extract_real(hb, pcm16, probe_n16, 2, content,
+        pT = wubu_hubert_extract_real(hb, probe_pcm, probe_n16, 2, content,
                                       maxT * content_dim);
         if (pT <= 0) { free(content); free(pf0); free(pcoarse); free(pnsf); break; }
         int pT2 = pT * 2;
@@ -124,7 +145,7 @@ float wubu_autokey_calibrate(WuBuRVCModel *model, WuBuHubert *hb,
         if (onf > 0) {
             float *ref = (float *)malloc((size_t)probe_frames * sizeof(float));
             if (ref) {
-                for (int i = 0; i < probe_frames; i++) ref[i] = f0_hz[i]; /* input key */
+                for (int i = 0; i < probe_frames; i++) ref[i] = probe_f0[i]; /* input key */
                 measure_drift(ref, probe_frames, of0, onf, &drift, &flip);
                 free(ref);
             }

@@ -86,32 +86,68 @@ static void conv1d_c(const float *in, int in_ch, int n,
     int n_out = (n + 2 * pad - dil * (k - 1) - 1) / stride + 1;
     if (n_out <= 0) return;
     memset(out, 0, (size_t)out_ch * n_out * sizeof(float));
-#pragma omp parallel for schedule(static) if(out_ch >= 32 && n_out >= 256)
-    for (int oc = 0; oc < out_ch; oc++) {
-        float *orow = out + (size_t)oc * n_out;
-        float bias = b ? b[oc] : 0.0f;
-        for (int j = 0; j < n_out; j++) orow[j] = bias;
-        if (!w) continue;
-        const float *wv = w + (size_t)oc * in_ch * k;
-        for (int ic = 0; ic < in_ch; ic++) {
-            const float *irow = in + (size_t)ic * n;
-            for (int tap = 0; tap < k; tap++) {
-                int off = tap * dil - pad;
-                float wt = wv[(size_t)ic * k + tap];
-                /* exact valid j range (src = j*stride + off in [0, n)):
-                 * no branch inside the inner loop → vectorizes cleanly. */
-                int j_lo = 0, j_hi = n_out;
-                if (stride == 1) {
-                    if (off < 0) j_lo = -off;
-                    if (n - off < j_hi) j_hi = n - off;
-                } else {
-                    if (off < 0) j_lo = (-off + stride - 1) / stride;
-                    if (n - off < 0) j_hi = 0;
-                    else if ((n - off + stride - 1) / stride < j_hi)
-                        j_hi = (n - off + stride - 1) / stride;
+    if (out_ch >= 32) {
+        /* INPUT-STATIONARY tiled conv: the naive oc-outer loop re-reads the
+         * whole input for every (oc,ic,tap) — on long audio the final stage
+         * tensor is GBs and that is 500x redundant memory traffic. Instead
+         * tile the SEQUENCE: each thread loads its input tile once and
+         * accumulates into ALL output channels. */
+        const int TILE = 8192;
+#pragma omp parallel for schedule(static) if(n_out >= TILE)
+        for (int jb = 0; jb < n_out; jb += TILE) {
+            int j_hi = jb + TILE < n_out ? jb + TILE : n_out;
+            for (int oc = 0; oc < out_ch; oc++) {
+                float *orow = out + (size_t)oc * n_out;
+                float bias = b ? b[oc] : 0.0f;
+                const float *wv = w + (size_t)oc * in_ch * k;
+                for (int j = jb; j < j_hi; j++) orow[j] += bias;
+                for (int ic = 0; ic < in_ch; ic++) {
+                    const float *irow = in + (size_t)ic * n;
+                    for (int tap = 0; tap < k; tap++) {
+                        int off = tap * dil - pad;
+                        float wt = wv[(size_t)ic * k + tap];
+                        int j_lo = jb, j_hi2 = j_hi;
+                        if (stride == 1) {
+                            if (off < 0) j_lo = -off;
+                            if (n - off < j_hi2) j_hi2 = n - off;
+                        } else {
+                            if (off < 0) j_lo = (-off + stride - 1) / stride;
+                            if (n - off < 0) j_hi2 = 0;
+                            else if ((n - off + stride - 1) / stride < j_hi2)
+                                j_hi2 = (n - off + stride - 1) / stride;
+                        }
+                        if (j_lo < jb) j_lo = jb;
+                        if (j_lo < j_hi2)
+                            for (int j = j_lo; j < j_hi2; j++)
+                                orow[j] += irow[j * stride + off] * wt;
+                    }
                 }
-                for (int j = j_lo; j < j_hi; j++)
-                    orow[j] += irow[j * stride + off] * wt;
+            }
+        }
+    } else {
+        /* few output channels (e.g. conv_post 1->1 over the full audio):
+         * parallelize over the SEQUENCE instead of the channels */
+        for (int oc = 0; oc < out_ch; oc++) {
+            float *orow = out + (size_t)oc * n_out;
+            float bias = b ? b[oc] : 0.0f;
+            const float *wv = w ? w + (size_t)oc * in_ch * k : NULL;
+            if (!wv) {
+                for (int j = 0; j < n_out; j++) orow[j] = bias;
+                continue;
+            }
+#pragma omp parallel for schedule(static) if(n_out >= 4096)
+            for (int j = 0; j < n_out; j++) {
+                float acc = bias;
+                for (int ic = 0; ic < in_ch; ic++) {
+                    const float *irow = in + (size_t)ic * n;
+                    const float *wrow = wv + (size_t)ic * k;
+                    for (int tap = 0; tap < k; tap++) {
+                        int src = j * stride + tap * dil - pad;
+                        if (src >= 0 && src < n)
+                            acc += irow[src] * wrow[tap];
+                    }
+                }
+                orow[j] = acc;
             }
         }
     }

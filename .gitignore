@@ -1,0 +1,17 @@
+# WuBuRVC — engine only. Weights live on the D: drive / user models dir.
+models/rvc/
+models/*.bin
+models/*.pt
+models/*.pth
+build/
+out/
+outputs/
+*.exe
+*.o
+*.so
+*.dll
+__pycache__/
+.venv_win/
+*.npy
+*.wav
+*.mp4

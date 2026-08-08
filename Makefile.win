@@ -1,0 +1,48 @@
+# WuBuRVC — Windows (MSYS2/MinGW) build
+# C11 only, OpenMP for conv kernels. CUDA training kernels via nvcc (sm_75+).
+CC    ?= gcc
+CFLAGS  = -std=c11 -O3 -I src -fopenmp
+LDLIBS  = -lm
+
+# MinGW gcc wants a writable TMP (else it falls back to C:\WINDOWS)
+export TMP := $(CURDIR)/build/tmp
+export TEMP := $(TMP)
+export TMPDIR := $(TMP)
+
+RVC_SRCS = src/wubu_rvc.c src/wubu_rvc_parity.c src/wubu_rvc_weights.c \
+           src/wubu_rvc_kernels_exact.c src/wubu_rvc_real.c src/wubu_rvc_hubert.c \
+           src/wubu_rvc_f0.c src/wubu_postproc.c src/wubu_rmvpe.c \
+           src/wubu_stft.c src/wubu_gru.c src/wubu_audioio.c
+
+all: build/wubu_rvc build/test_rmvpe build/test_master build/wubu_mixmaster
+
+build/wubu_rvc: src/wubu_rvc_cli.c $(RVC_SRCS)
+	mkdir -p build
+	$(CC) $(CFLAGS) $^ $(LDLIBS) -o $@
+
+build/test_rmvpe: tests/test_rmvpe.c src/wubu_rmvpe.c src/wubu_stft.c src/wubu_gru.c
+	mkdir -p build
+	$(CC) -std=c11 -O2 -I src -fopenmp $^ $(LDLIBS) -o $@
+
+build/test_master: tests/test_master.c src/wubu_master.c src/wubu_audioio.c
+	mkdir -p build
+	$(CC) -std=c11 -O2 -I src $^ $(LDLIBS) -o $@
+
+build/wubu_mixmaster: tools/wubu_mixmaster.c src/wubu_master.c src/wubu_audioio.c
+	mkdir -p build
+	$(CC) -std=c11 -O2 -I src $^ $(LDLIBS) -o $@
+
+# CUDA training kernels (requires nvcc; sm_75 = RTX 2080 SUPER)
+cuda:
+	nvcc -O3 -arch=sm_75 -I src -c src/wubu_rvc_kernels.cu -o build/wubu_rvc_kernels.o
+	nvcc -O3 -arch=sm_75 -I src -c src/wubu_rvc_mono.cu -o build/wubu_rvc_mono.o
+
+test: all
+	./build/test_master
+	@echo "Run test_rmvpe with models/ + outputs/rvc_ref present:"
+	@echo "  ./build/test_rmvpe"
+
+clean:
+	rm -rf build
+
+.PHONY: all cuda test clean

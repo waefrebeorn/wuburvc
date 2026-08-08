@@ -26,6 +26,17 @@ No Python at runtime. No torch. No "third party" — *we properly make it*.
 | **Speed** | OpenMP on all convs; RMVPE/GRU parallelized; CLI at -O3 |
 | **License** | WaefreBeorn Umbrella License v3.0 (source-available, attribution) |
 
+## Accelerators (all backends, one agnostic engine)
+
+| Backend | Status | Notes |
+|---|---|---|
+| **CPU (C11)** | default | AVX2/FMA micro-kernels in conv1d + linear; chunked parallel inference (3s chunks, pthread pool, ~2x); jobs flag (default 4) |
+| **CUDA (sm_75)** | `--cuda` | GeneratorNSF on the RTX 2080 SUPER via src/wubu_rvc_cuda.cu (CRT-free, links into MinGW with cudart; build via cmd /c build/cuda_build.bat); loads any model from config+weight shapes (40k/32k/48k verified) |
+| **Vulkan** | `--vk` | Cross-vendor (NVIDIA/AMD/Intel) compute shaders: src/wubu_vk.c (opaque struct, embedded SPIR-V from the .comp shaders); conv1d/convt1d/act/elt + the full generator; kernel parity corr 1.000000 vs reference |
+| **Triton** | researched | Portable DSL across NVIDIA+AMD; would be the first RVC/Triton kernels — a separate service (Python JIT), not embedded in the C11 binary |
+
+Research: knowledge/ENGINE_OPTIMIZATION_RESEARCH.md, knowledge/ACCELERATOR_CUDA_TRITON.md, knowledge/VULKAN_ACCELERATOR.md.
+
 ## Verified by the numbers
 
 ```

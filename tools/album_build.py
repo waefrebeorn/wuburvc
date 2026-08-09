@@ -22,17 +22,34 @@ import sys
 import glob
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CLI = os.path.join(ROOT, "build", "wubu_rvc_fast.exe")
+
+
+def _find_cli():
+    for c in ["wubu_rvc_vk.exe.exe", "wubu_rvc_vk.exe", "wubu_rvc_fast.exe"]:
+        p = os.path.join(ROOT, "build", c)
+        if os.path.isfile(p):
+            return p
+    return os.path.join(ROOT, "build", "wubu_rvc_vk.exe")
+
+
+CLI = _find_cli()
 MIX = os.path.join(ROOT, "build", "wubu_mixmaster.exe")
 SLICE = os.path.join(ROOT, "tools", "slice_stems.py")
-VOICE = os.path.join(ROOT, "models", "rvc", "cleveland",
+MEDIA = r"C:\Users\eman5\WuBuMedia"
+HUBERT = os.path.join(MEDIA, "models", "rvc", "hubert_weights.bin")
+VOICE = os.path.join(MEDIA, "models", "rvc", "cleveland",
                      "Cleveland_Brown_220e_7920s.pth")
 VOCAL_GAIN = 2.512  # +8.01 dB (Ardour ACE Expander makeup on the vocal)
-OUT = os.path.join(ROOT, "out", "album")
+OUT = os.path.join(MEDIA, "out", "album")
 
 
 def run(cmd):
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    # engine exe needs MinGW runtime DLLs from MSYS2 — prepend to PATH
+    env = dict(os.environ)
+    mingw = r"C:\msys64\mingw64\bin"
+    if mingw not in env.get("PATH", ""):
+        env["PATH"] = mingw + os.pathsep + env.get("PATH", "")
+    r = subprocess.run(cmd, capture_output=True, text=True, env=env)
     if r.returncode != 0:
         print("FAIL:", " ".join(cmd[:4]), r.stderr[-400:])
         return False
@@ -69,7 +86,8 @@ def build(proj_dir, lead_pat, out_name, voice=VOICE):
     # 2. convert with Cleveland Brown
     vocal = os.path.join(OUT, f"{out_name}_vocal.wav")
     if not run([CLI, lead, os.path.dirname(voice), vocal,
-                "--model", voice, "--noise", "0.33333", "--autokey", "8"]):
+                "--model", voice, "--hubert", HUBERT,
+                "--noise", "0.33333", "--autokey", "8"]):
         return 1
     print(f"[2] converted: {vocal}")
 

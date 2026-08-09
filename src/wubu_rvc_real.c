@@ -92,6 +92,9 @@ void wubu_set_conv_tile(int tile) {
 }
 int wubu_get_conv_tile(void) { return g_conv_tile; }
 
+/* Fast-math switch lives in wubu_math.c (shared with GRU/HuBERT/RMVPE):
+ * wubu_get_fast_math() — 0 = libm (byte-identical), 1 = folded-poly (speed). */
+
 void conv1d_c(const float *in, int in_ch, int n,
               const float *w, const float *b,
               int out_ch, int k, int stride, int pad, int dil,
@@ -651,7 +654,9 @@ static void snake_lrelu_c(float *x, size_t n, float slope) {
 /* GELU as used by Mangio-RVC lib/infer_pack/attentions.py FFN:
  * x * sigmoid(1.702 * x). This is a distinct tanh-family form — the
  * text encoder was trained with it, so match it EXACTLY. */
-static float sigmoid_c(float x) { return 1.0f / (1.0f + expf(-x)); }
+static float sigmoid_c(float x) {
+    return wubu_get_fast_math() ? wubu_fastsigmoid(x) : (1.0f / (1.0f + expf(-x)));
+}
 static float gelu_c(float x) { return x * sigmoid_c(1.702f * x); }
 
 /* LayerNorm over channels (gamma/beta per channel), [C, T] */
@@ -1146,7 +1151,7 @@ static void wn_forward(const WNBlock *wn, float *x, int T,
             for (int j = 0; j < T; j++) {
                 float a = x_in[(size_t)c * T + j] + (gl ? gl[(size_t)c * T + j] : 0.0f);
                 float b = x_in[(size_t)(H + c) * T + j] + (gl ? gl[(size_t)(H + c) * T + j] : 0.0f);
-                acts[(size_t)c * T + j] = tanhf(a) * sigmoid_c(b);
+                acts[(size_t)c * T + j] = (wubu_get_fast_math() ? wubu_fasttanh(a) : tanhf(a)) * sigmoid_c(b);
             }
         }
         /* rs = res_skip_layers[i](acts): Conv1d(H -> 2H (i<L-1) or H (last), k=1) */
@@ -1685,7 +1690,7 @@ int wubu_generator_nsf(WuBuRVCModel *model,
                         acc += cur[(size_t)c * cur_n + src] * kw[tap];
                 }
             }
-            out[j] = tanhf(acc); /* final activation */
+            out[j] = tanhf(acc); /* final activation — keep libm: this op's error goes straight to the output waveform */
         }
     }
     /* Snake saturation detection (replaces the old 0.15/max_out gain hack,
@@ -1797,7 +1802,7 @@ int wubu_rvc_synthesize_real(WuBuRVCModel *model,
                 r *= randn_scale;
             }
             z_p[(size_t)c * n_frames + j] =
-                (m[(size_t)c * n_frames + j] + expf(logs[(size_t)c * n_frames + j]) * r) * x_mask[j];
+                (m[(size_t)c * n_frames + j] + (wubu_get_fast_math() ? wubu_fastexp(logs[(size_t)c * n_frames + j]) : expf(logs[(size_t)c * n_frames + j])) * r) * x_mask[j];
             /* Clamp z_p to [-3, 3] (3 sigma for N(0,1) with noise_scale ~0.5).
              * Prevents extreme values that saturate the tanh output. */
             if (z_p[(size_t)c * n_frames + j] > 3.0f) z_p[(size_t)c * n_frames + j] = 3.0f;
@@ -1872,7 +1877,7 @@ int wubu_rvc_synthesize_real_cuda(WuBuRVCModel *model,
                 r *= randn_scale;
             }
             z_p[(size_t)c * n_frames + j] =
-                (m[(size_t)c * n_frames + j] + expf(logs[(size_t)c * n_frames + j]) * r) * x_mask[j];
+                (m[(size_t)c * n_frames + j] + (wubu_get_fast_math() ? wubu_fastexp(logs[(size_t)c * n_frames + j]) : expf(logs[(size_t)c * n_frames + j])) * r) * x_mask[j];
             if (z_p[(size_t)c * n_frames + j] > 3.0f) z_p[(size_t)c * n_frames + j] = 3.0f;
             if (z_p[(size_t)c * n_frames + j] < -3.0f) z_p[(size_t)c * n_frames + j] = -3.0f;
         }
@@ -1939,7 +1944,7 @@ int wubu_rvc_synthesize_real_vk(WuBuRVCModel *model,
                 r *= randn_scale;
             }
             z_p[(size_t)c * n_frames + j] =
-                (m[(size_t)c * n_frames + j] + expf(logs[(size_t)c * n_frames + j]) * r) * x_mask[j];
+                (m[(size_t)c * n_frames + j] + (wubu_get_fast_math() ? wubu_fastexp(logs[(size_t)c * n_frames + j]) : expf(logs[(size_t)c * n_frames + j])) * r) * x_mask[j];
             if (z_p[(size_t)c * n_frames + j] > 3.0f) z_p[(size_t)c * n_frames + j] = 3.0f;
             if (z_p[(size_t)c * n_frames + j] < -3.0f) z_p[(size_t)c * n_frames + j] = -3.0f;
         }

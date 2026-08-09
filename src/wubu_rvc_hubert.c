@@ -9,6 +9,7 @@
 
 #define _USE_MATH_DEFINES
 #include "wubu_rvc_hubert.h"
+#include "wubu_math.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -359,7 +360,7 @@ static void hubert_layer(const WuBuHubert *h, float *x768, int L, int T,
             float mx = -1e30f;
             for (int tj = 0; tj < T; tj++) if (srow[(size_t)ti * T + tj] > mx) mx = srow[(size_t)ti * T + tj];
             float sum = 0;
-            for (int tj = 0; tj < T; tj++) { float e = expf(srow[(size_t)ti * T + tj] - mx); srow[(size_t)ti * T + tj] = e; sum += e; }
+            for (int tj = 0; tj < T; tj++) { float e = (wubu_get_fast_math() ? wubu_fastexp(srow[(size_t)ti * T + tj] - mx) : expf(srow[(size_t)ti * T + tj] - mx)); srow[(size_t)ti * T + tj] = e; sum += e; }
             for (int tj = 0; tj < T; tj++) srow[(size_t)ti * T + tj] /= (sum + 1e-12f);
         }
     }
@@ -474,7 +475,7 @@ static void linear_c(const float *in, int in_d, int n,
  * x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
  * NOTE: the cubic term is x^3 (fairseq uses pow(x,3)); the erf form of
  * torch.nn.GELU is NOT what hubert_base.pt was trained/run with. */
-static float gelu_c(float x) { return x * (0.5f * (1.0f + tanhf(0.7978845608f * (x + 0.044715f * x * x * x)))); }
+static float gelu_c(float x) { return x * (0.5f * (1.0f + (wubu_get_fast_math() ? wubu_fasttanh(0.7978845608f * (x + 0.044715f * x * x * x)) : tanhf(0.7978845608f * (x + 0.044715f * x * x * x))))); }
 
 /* ── pos_conv weight_norm (dim=2): W[oc,ic,k] = g[k] * v[oc,ic,k]/||v[oc,ic,:]|| ── */
 static void pos_conv_apply(const WuBuHubert *h, const float *x, int T,

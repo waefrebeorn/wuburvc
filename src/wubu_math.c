@@ -147,6 +147,15 @@ void wubu_sincos8_folded(const float *x, float *s, float *c, int n) {
  * (fp32-class) — the same class as the bit-trick fold. Used for the encoder
  * softmax + the flow's exp where the libm's full-precision path is overkill.
  * Reference: the QuAKE paper's fast exp (10-35% total inference speedup). */
+/* ── Fast-math switch (folded-poly / bit-trick approximations) ──
+ * 0 (default): libm expf/tanhf — byte-identical output (quality mode).
+ * 1: wubu_fastexp/fastsigmoid/fasttanh (~7e-6 accuracy) — speed mode.
+ * Lives here (not real.c) so GRU/HuBERT/RMVPE can share it without
+ * linking real.o. */
+static int g_fast_math = 0;
+void wubu_set_fast_math(int on) { g_fast_math = on ? 1 : 0; }
+int wubu_get_fast_math(void) { return g_fast_math; }
+
 float wubu_fastexp(float x) {
     /* 2^(x * log2(e)): add x*log2(e)*2^23 to the float exponent bits.
      * 12102203.0f = 2^23 * log2(e) ; 1065353216 = 127 << 23 (bias). */
@@ -157,6 +166,12 @@ float wubu_fastexp(float x) {
     if (t < -12102203.0f * 30.0f) t = -12102203.0f * 30.0f;
     u.i = (int32_t)t + 1065353216;
     return u.f;
+}
+
+/* fast sigmoid via the bit-trick exp: 1/(1+exp(-x)) */
+float wubu_fastsigmoid(float x) {
+    float e = wubu_fastexp(-x);
+    return 1.0f / (1.0f + e);
 }
 
 /* fast tanh via the sigmoid: tanh(x) = 2·sigmoid(2x) − 1 */

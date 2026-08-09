@@ -19,6 +19,7 @@
 #include "wubu_rmvpe.h"
 #include "wubu_stft.h"
 #include "wubu_gru.h"
+#include "wubu_math.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -533,7 +534,7 @@ int wubu_rmvpe_f0(WuBuRmvpe *r, const float *pcm, int n_samples,
                 const float *wrow = fw + (size_t)k * 512;
                 float acc = fb[k];
                 for (int j = 0; j < 512; j++) acc += wrow[j] * gt[j];
-                gru_out[(size_t)t * 360 + k] = 1.0f / (1.0f + expf(-acc));
+                gru_out[(size_t)t * 360 + k] = 1.0f / (1.0f + expf(-acc));  /* F0 head: keep libm — pitch contour must stay exact */
             }
         }
 

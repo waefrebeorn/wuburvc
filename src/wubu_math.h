@@ -19,9 +19,16 @@ float wubu_sinf_folded(float x);
 /* Fast exp (IEEE-754 bit trick): ~7e-6 accuracy, fp32-class — for softmax,
  * activations, and the flow's exp where libm precision is overkill. */
 float wubu_fastexp(float x);
+float wubu_fastsigmoid(float x);
 
 /* Fast tanh via the sigmoid: 2·sigmoid(2x)−1, same accuracy class. */
 float wubu_fasttanh(float x);
+
+/* Fast-math switch: 0 (default) = libm expf/tanhf (byte-identical output);
+ * 1 = folded-poly/bit-trick approximations (~7e-6 accuracy) — speed mode.
+ * Shared by real.c, gru.c, hubert.c, rmvpe.c. */
+void wubu_set_fast_math(int on);
+int wubu_get_fast_math(void);
 
 /* AVX2 (8-wide): compute 8 sines + 8 cosines. Requires __AVX2__ + __FMA__;
  * on non-AVX2 builds falls back to the scalar loop. */

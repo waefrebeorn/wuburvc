@@ -31,6 +31,7 @@
 #include "wubu_rmvpe.h"
 #include "wubu_audioio.h"
 #include "wubu_autokey.h"
+#include "wubu_math.h"
 #include "wubu_pitch.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -392,10 +393,12 @@ int main(int argc, char **argv) {
     if (mode_speed) {
         if (ctx_secs == 0.72f) ctx_secs = 0.40f;  /* don't override explicit --ctx */
         wubu_set_conv_tile(2048);
-        printf("[0] mode: speed (ctx %.2f, conv tile %d) — real-time CPU\n",
+        wubu_set_fast_math(1);  /* folded-poly exp/tanh/sigmoid (~7e-6) */
+        printf("[0] mode: speed (ctx %.2f, conv tile %d, fast math) — real-time CPU\n",
                ctx_secs, wubu_get_conv_tile());
     } else {
         wubu_set_conv_tile(8192);
+        wubu_set_fast_math(0);  /* libm — byte-identical reference output */
         printf("[0] mode: quality (ctx %.2f, conv tile %d) — reference output\n",
                ctx_secs, wubu_get_conv_tile());
     }

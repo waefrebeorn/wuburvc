@@ -11,6 +11,7 @@
  */
 #define _USE_MATH_DEFINES
 #include "wubu_gru.h"
+#include "wubu_math.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -31,7 +32,7 @@ struct WuBuGru {
     int bidirectional;
 };
 
-static float sigmoidf(float x) { return 1.0f / (1.0f + expf(-x)); }
+static float sigmoidf(float x) { return 1.0f / (1.0f + expf(-x)); }  /* RMVPE GRU gates → F0: keep libm */
 
 WuBuGru *wubu_gru_create(int input_size, int hidden_size, int bidirectional) {
     if (input_size < 1 || hidden_size < 1) return NULL;
@@ -104,7 +105,7 @@ static void gru_dir_run(const GruDir *d, const float *x, int T, float *hseq) {
              * g[2h+j] currently holds the un-gated sum; rebuild gated. */
             float hh = d->b_hh[2 * h + j];
             for (int k = 0; k < h; k++) hh += whn[(size_t)j * h + k] * h_prev[k];
-            float n = tanhf(g[2 * h + j] - hh + r * hh);
+            float n = tanhf(g[2 * h + j] - hh + r * hh);  /* RMVPE GRU → F0: keep libm */
             ht[j] = (1.0f - z) * n + z * h_prev[j];
         }
         memcpy(h_prev, ht, (size_t)h * sizeof(float));

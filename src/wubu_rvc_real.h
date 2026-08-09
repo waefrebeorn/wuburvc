@@ -40,6 +40,12 @@ int wubu_denorm_tensor(const RVCTensor *g, const RVCTensor *v,
 void wubu_set_conv_tile(int tile);
 int wubu_get_conv_tile(void);
 
+/* Fast-math switch: 0 (default) = libm expf/tanhf (byte-identical output);
+ * 1 = folded-poly/bit-trick approximations (~7e-6 accuracy) — speed mode.
+ * Defined in wubu_math.h (shared), set by the CLI in --mode speed. */
+void wubu_set_fast_math(int on);
+int wubu_get_fast_math(void);
+
 /* ── Real RVC synthesis (the whole acoustic model) ──
  * model: loaded WuBuRVCModel (tensor map must contain enc_p.*, flow.*,
  *        dec.*, emb_g.weight).

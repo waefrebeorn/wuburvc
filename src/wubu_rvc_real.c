@@ -13,6 +13,7 @@
 
 #define _USE_MATH_DEFINES
 #include "wubu_rvc_real.h"
+#include "wubu_math.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -98,88 +99,118 @@ void conv1d_c(const float *in, int in_ch, int n,
 #pragma omp parallel for schedule(dynamic, 4) num_threads(omp_in_parallel() ? 4 : 12) if(n_out >= TILE)
         for (int jb = 0; jb < n_out; jb += TILE) {
             int j_hi = jb + TILE < n_out ? jb + TILE : n_out;
+#if defined(__AVX2__) && defined(__FMA__)
+            if (stride == 1 && in_ch >= 8 && k >= 1) {
+                /* REGISTER-ACCUMULATED AVX2, OC-BLOCKED (4 output channels
+                 * share each input load — input traffic ÷4, orow once per
+                 * block). The whole (ic,tap) accumulation happens INSIDE
+                 * each 32-sample block. */
+                    enum { OC_BLK = 4 };
+                    int j_in_lo = jb < pad ? pad : jb;
+                    int j_in_hi = n - (k - 1) * dil + pad;
+                    if (j_in_hi > j_hi) j_in_hi = j_hi;
+                    int jr_max = n - 32 - (k - 1) * dil + pad;
+                    if (jr_max > j_in_hi - 32) jr_max = j_in_hi - 32;
+                    for (int oc0 = 0; oc0 < out_ch; oc0 += OC_BLK) {
+                        int n_oc = OC_BLK;
+                        if (oc0 + n_oc > out_ch) n_oc = out_ch - oc0;
+                        float *orow0[OC_BLK];
+                        const float *wv0[OC_BLK];
+                        float bias0[OC_BLK];
+                        for (int oc = 0; oc < n_oc; oc++) {
+                            orow0[oc] = out + (size_t)(oc0 + oc) * n_out;
+                            wv0[oc] = w + (size_t)(oc0 + oc) * in_ch * k;
+                            bias0[oc] = b ? b[oc0 + oc] : 0.0f;
+                            for (int j = jb; j < j_hi; j++) orow0[oc][j] += bias0[oc];
+                        }
+                        /* left boundary: full (ic,tap) sum, bounds-checked */
+                        for (int j = jb; j < j_in_lo && j < j_hi; j++)
+                            for (int oc = 0; oc < n_oc; oc++) {
+                                const float *wv = wv0[oc];
+                                float acc = orow0[oc][j];
+                                for (int ick = 0; ick < in_ch; ick++) {
+                                    const float *ir2 = in + (size_t)ick * n;
+                                    const float *wv2 = wv + (size_t)ick * k;
+                                    for (int tap = 0; tap < k; tap++) {
+                                        int src = j + tap * dil - pad;
+                                        if (src >= 0 && src < n) acc += ir2[src] * wv2[tap];
+                                    }
+                                }
+                                orow0[oc][j] = acc;
+                            }
+                        /* interior: all taps valid; register-blocked, 4-oc shared input */
+                        int jr = j_in_lo;
+                        for (; jr <= jr_max; jr += 32) {
+                            __m256 a0[OC_BLK], a1[OC_BLK], a2[OC_BLK], a3[OC_BLK];
+                            for (int oc = 0; oc < n_oc; oc++) {
+                                a0[oc] = _mm256_loadu_ps(orow0[oc] + jr);
+                                a1[oc] = _mm256_loadu_ps(orow0[oc] + jr + 8);
+                                a2[oc] = _mm256_loadu_ps(orow0[oc] + jr + 16);
+                                a3[oc] = _mm256_loadu_ps(orow0[oc] + jr + 24);
+                            }
+                            for (int ick = 0; ick < in_ch; ick++) {
+                                const float *ir2 = in + (size_t)ick * n + jr - pad;
+                                for (int tap = 0; tap < k; tap++) {
+                                    __m256 iv0 = _mm256_loadu_ps(ir2 + tap * dil);
+                                    __m256 iv1 = _mm256_loadu_ps(ir2 + 8 + tap * dil);
+                                    __m256 iv2 = _mm256_loadu_ps(ir2 + 16 + tap * dil);
+                                    __m256 iv3 = _mm256_loadu_ps(ir2 + 24 + tap * dil);
+                                    for (int oc = 0; oc < n_oc; oc++) {
+                                        float wt = wv0[oc][(size_t)ick * k + tap];
+                                        __m256 wv8 = _mm256_set1_ps(wt);
+                                        a0[oc] = _mm256_fmadd_ps(iv0, wv8, a0[oc]);
+                                        a1[oc] = _mm256_fmadd_ps(iv1, wv8, a1[oc]);
+                                        a2[oc] = _mm256_fmadd_ps(iv2, wv8, a2[oc]);
+                                        a3[oc] = _mm256_fmadd_ps(iv3, wv8, a3[oc]);
+                                    }
+                                }
+                            }
+                            for (int oc = 0; oc < n_oc; oc++) {
+                                _mm256_storeu_ps(orow0[oc] + jr, a0[oc]);
+                                _mm256_storeu_ps(orow0[oc] + jr + 8, a1[oc]);
+                                _mm256_storeu_ps(orow0[oc] + jr + 16, a2[oc]);
+                                _mm256_storeu_ps(orow0[oc] + jr + 24, a3[oc]);
+                            }
+                        }
+                        /* 8-wide tail: per-oc */
+                        for (; jr + 8 <= j_in_hi && jr + 7 + (k - 1) * dil - pad < n; jr += 8)
+                            for (int oc = 0; oc < n_oc; oc++) {
+                                const float *wv = wv0[oc];
+                                __m256 a0 = _mm256_loadu_ps(orow0[oc] + jr);
+                                for (int ick = 0; ick < in_ch; ick++) {
+                                    const float *ir2 = in + (size_t)ick * n + jr - pad;
+                                    const float *wv2 = wv + (size_t)ick * k;
+                                    for (int tap = 0; tap < k; tap++) {
+                                        a0 = _mm256_fmadd_ps(_mm256_loadu_ps(ir2 + tap * dil),
+                                                             _mm256_set1_ps(wv2[tap]), a0);
+                                    }
+                                }
+                                _mm256_storeu_ps(orow0[oc] + jr, a0);
+                            }
+                        /* right boundary + tail (full sum, bounds-checked) */
+                        for (; jr < j_hi; jr++)
+                            for (int oc = 0; oc < n_oc; oc++) {
+                                const float *wv = wv0[oc];
+                                float acc = orow0[oc][jr];
+                                for (int ick = 0; ick < in_ch; ick++) {
+                                    const float *ir2 = in + (size_t)ick * n;
+                                    const float *wv2 = wv + (size_t)ick * k;
+                                    for (int tap = 0; tap < k; tap++) {
+                                        int src = jr + tap * dil - pad;
+                                        if (src >= 0 && src < n) acc += ir2[src] * wv2[tap];
+                                    }
+                                }
+                                orow0[oc][jr] = acc;
+                            }
+                    }
+                    continue; /* full (ic,tap) done — skip the per-tap loops */
+                }
+#endif
             for (int oc = 0; oc < out_ch; oc++) {
                 float *orow = out + (size_t)oc * n_out;
                 float bias = b ? b[oc] : 0.0f;
                 const float *wv = w + (size_t)oc * in_ch * k;
                 for (int j = jb; j < j_hi; j++) orow[j] += bias;
-#if defined(__AVX2__) && defined(__FMA__)
-                if (stride == 1 && in_ch >= 8 && k >= 1) {
-                    /* REGISTER-ACCUMULATED AVX2: the whole (ic,tap)
-                     * accumulation happens INSIDE each 32-sample block — orow
-                     * is loaded+stored once per block instead of once per
-                     * (ic,tap). Eliminates ~768x redundant orow traffic, the
-                     * MRF's dominant cost. Runs INSTEAD of the (ic,tap) loops
-                     * below. */
-                    int j_in_lo = jb < pad ? pad : jb;
-                    int j_in_hi = n - (k - 1) * dil + pad;
-                    if (j_in_hi > j_hi) j_in_hi = j_hi;
-                    /* left boundary: full (ic,tap) sum, bounds-checked */
-                    for (int j = jb; j < j_in_lo && j < j_hi; j++) {
-                        float acc = orow[j];
-                        for (int ick = 0; ick < in_ch; ick++) {
-                            const float *ir2 = in + (size_t)ick * n;
-                            const float *wv2 = wv + (size_t)ick * k;
-                            for (int tap = 0; tap < k; tap++) {
-                                int src = j + tap * dil - pad;
-                                if (src >= 0 && src < n) acc += ir2[src] * wv2[tap];
-                            }
-                        }
-                        orow[j] = acc;
-                    }
-                    /* interior: all taps valid; register-blocked */
-                    int jr_max = n - 32 - (k - 1) * dil + pad;
-                    if (jr_max > j_in_hi - 32) jr_max = j_in_hi - 32;
-                    int jr = j_in_lo;
-                    for (; jr <= jr_max; jr += 32) {
-                        __m256 a0 = _mm256_loadu_ps(orow + jr);
-                        __m256 a1 = _mm256_loadu_ps(orow + jr + 8);
-                        __m256 a2 = _mm256_loadu_ps(orow + jr + 16);
-                        __m256 a3 = _mm256_loadu_ps(orow + jr + 24);
-                        for (int ick = 0; ick < in_ch; ick++) {
-                            const float *ir2 = in + (size_t)ick * n + jr - pad;
-                            const float *wv2 = wv + (size_t)ick * k;
-                            for (int tap = 0; tap < k; tap++) {
-                                __m256 wv8 = _mm256_set1_ps(wv2[tap]);
-                                a0 = _mm256_fmadd_ps(_mm256_loadu_ps(ir2 + tap * dil), wv8, a0);
-                                a1 = _mm256_fmadd_ps(_mm256_loadu_ps(ir2 + 8 + tap * dil), wv8, a1);
-                                a2 = _mm256_fmadd_ps(_mm256_loadu_ps(ir2 + 16 + tap * dil), wv8, a2);
-                                a3 = _mm256_fmadd_ps(_mm256_loadu_ps(ir2 + 24 + tap * dil), wv8, a3);
-                            }
-                        }
-                        _mm256_storeu_ps(orow + jr, a0);
-                        _mm256_storeu_ps(orow + jr + 8, a1);
-                        _mm256_storeu_ps(orow + jr + 16, a2);
-                        _mm256_storeu_ps(orow + jr + 24, a3);
-                    }
-                    for (; jr + 8 <= j_in_hi && jr + 7 + (k - 1) * dil - pad < n; jr += 8) {
-                        __m256 a0 = _mm256_loadu_ps(orow + jr);
-                        for (int ick = 0; ick < in_ch; ick++) {
-                            const float *ir2 = in + (size_t)ick * n + jr - pad;
-                            const float *wv2 = wv + (size_t)ick * k;
-                            for (int tap = 0; tap < k; tap++) {
-                                a0 = _mm256_fmadd_ps(_mm256_loadu_ps(ir2 + tap * dil),
-                                                     _mm256_set1_ps(wv2[tap]), a0);
-                            }
-                        }
-                        _mm256_storeu_ps(orow + jr, a0);
-                    }
-                    /* right boundary + tail (full sum, bounds-checked) */
-                    for (; jr < j_hi; jr++) {
-                        float acc = orow[jr];
-                        for (int ick = 0; ick < in_ch; ick++) {
-                            const float *ir2 = in + (size_t)ick * n;
-                            const float *wv2 = wv + (size_t)ick * k;
-                            for (int tap = 0; tap < k; tap++) {
-                                int src = jr + tap * dil - pad;
-                                if (src >= 0 && src < n) acc += ir2[src] * wv2[tap];
-                            }
-                        }
-                        orow[jr] = acc;
-                    }
-                    continue; /* full (ic,tap) done — skip the per-tap loops */
-                }
-#endif
                 for (int ic = 0; ic < in_ch; ic++) {
                     const float *irow = in + (size_t)ic * n;
                     for (int tap = 0; tap < k; tap++) {
@@ -313,7 +344,20 @@ static void embedding_c(const float *emb, int num, int dim,
 }
 
 static void lrelu_c(float *x, size_t n, float slope) {
+#if defined(__AVX2__)
+    __m256 s8 = _mm256_set1_ps(slope);
+    __m256 z = _mm256_setzero_ps();
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        __m256 v = _mm256_loadu_ps(x + i);
+        __m256 neg = _mm256_mul_ps(v, s8);
+        __m256 r = _mm256_blendv_ps(neg, v, _mm256_cmp_ps(v, z, _CMP_GT_OQ));
+        _mm256_storeu_ps(x + i, r);
+    }
+    for (; i < n; i++) x[i] = x[i] > 0 ? x[i] : slope * x[i];
+#else
     for (size_t i = 0; i < n; i++) x[i] = x[i] > 0 ? x[i] : slope * x[i];
+#endif
 }
 
 /* Snake activation (BigVGAN): f(x) = x + (1/a) * sin^2(a*x).
@@ -326,7 +370,8 @@ static void lrelu_c(float *x, size_t n, float slope) {
  * CLI falls back to LeakyReLU (parity-verified SNR 29.79 dB) with a warning.
  * Snake stays available for models actually TRAINED with it (BigVGAN). */
 static inline float snake_c(float x, float a) {
-    return x + (1.0f / a) * (sinf(a * x) * sinf(a * x));
+    float s = wubu_sinf_folded(a * x);
+    return x + (1.0f / a) * (s * s);
 }
 static void snake_lrelu_c(float *x, size_t n, float slope) {
     (void)slope;  /* BigVGAN Snake has no LReLU term */
@@ -434,7 +479,7 @@ static void mha_forward_t(const MHA *mha, const float *x, const float *c,
             }
             float sum = 0;
             for (int tj = 0; tj < T; tj++) {
-                float e = expf(srow[(size_t)ti * T + tj] - mx);
+                float e = wubu_fastexp(srow[(size_t)ti * T + tj] - mx);
                 srow[(size_t)ti * T + tj] = e;
                 sum += e;
             }
@@ -1099,7 +1144,7 @@ int wubu_generator_nsf(WuBuRVCModel *model,
             int u = j % ups_total;   /* sample index within frame: 0..upp-1 */
             float phase = rad[fi] * (float)(u + 1);  /* f0/sr * (u+1) */
             if (fi > 0) phase += rad_acc[fi - 1];     /* add carry from prev frame */
-            float s = sinf(2.0f * (float)M_PI * phase) * 0.1f;  /* sine_amp = 0.1 */
+            float s = wubu_sinf_folded(2.0f * (float)M_PI * phase) * 0.1f;  /* sine_amp = 0.1 */
             float sv = (nsff0[fi] > 0) ? 1.0f : 0.0f;  /* uv mask */
             /* Phase 4 improvement: noise injection in NSF sine generation.
              * PyTorch SineGen injects uniform noise in unvoiced regions:
@@ -1109,7 +1154,7 @@ int wubu_generator_nsf(WuBuRVCModel *model,
             float noise_amp = inject_noise ? (1.0f - sv) * 0.1f / 3.0f : 0.0f;
             float noise = noise_amp * wubu_rand_uniform(-1.0f, 1.0f);
             float sw = s * sv + noise;                     /* sine * uv + noise * (1-uv) */
-            sine[j] = tanhf(linw * sw + linb);             /* l_linear + tanh */
+            sine[j] = wubu_fasttanh(linw * sw + linb);             /* l_linear + tanh */
         }
         free(carry); free(rad_acc); free(rad);
     }
@@ -1222,7 +1267,12 @@ int wubu_generator_nsf(WuBuRVCModel *model,
             if (n_pairs > 8) n_pairs = 8;
             /* per-stack accumulators — no shared writes. */
             float *acc = (float *)calloc((size_t)n_stacks * ch * next_n, sizeof(float));
-            if (acc) {
+            /* pooled per-stack scratch: one 3-slab arena instead of 216
+             * malloc/free churn per chunk (the L1 slab alone is 18.9MB). */
+            float *pool_in  = (float *)malloc((size_t)n_stacks * ch * next_n * sizeof(float));
+            float *pool_out = (float *)malloc((size_t)n_stacks * ch * next_n * sizeof(float));
+            float *pool_tmp = (float *)malloc((size_t)n_stacks * ch * next_n * sizeof(float));
+            if (acc && pool_in && pool_out && pool_tmp) {
                 /* the 3 stacks are INDEPENDENT (same stage input, different
                  * weights) — run them in parallel. Nested OMP (set in main):
                  * each stack thread gets its own conv parallelism via the
@@ -1234,9 +1284,8 @@ int wubu_generator_nsf(WuBuRVCModel *model,
                     int rb = L * n_stacks + s;
                     int k = model->resblock_k[s];
                     if (k <= 0) k = (s == 0) ? 3 : (s == 1 ? 7 : 11); /* legacy */
-                    float *rb_in = (float *)malloc((size_t)ch * next_n * sizeof(float));
-                    float *rb_out = (float *)malloc((size_t)ch * next_n * sizeof(float));
-                    if (!rb_in || !rb_out) { free(rb_in); free(rb_out); continue; }
+                    float *rb_in = pool_in + (size_t)s * ch * next_n;
+                    float *rb_out = pool_out + (size_t)s * ch * next_n;
                     memcpy(rb_in, stage[L], (size_t)ch * next_n * sizeof(float));
                     for (int cp = 0; cp < n_pairs; cp++) {
                         snprintf(key, sizeof(key), "dec.resblocks.%d.convs1.%d.weight_v", rb, cp);
@@ -1256,8 +1305,8 @@ int wubu_generator_nsf(WuBuRVCModel *model,
                          * weight_v in place — data is the final weight. */
                         const float *d1 = r1v->data;
                         const float *d2 = r2v->data;
-                        float *tmp = (float *)malloc((size_t)ch * next_n * sizeof(float));
-                        if (tmp) {
+                        float *tmp = pool_tmp + (size_t)s * ch * next_n;
+                        {
                             /* x = leaky(x); conv1; leaky; conv2; + residual */
                             memcpy(tmp, rb_in, (size_t)ch * next_n * sizeof(float));
                             if (use_snake) snake_lrelu_c(tmp, (size_t)ch * next_n, 0.1f);
@@ -1268,10 +1317,21 @@ int wubu_generator_nsf(WuBuRVCModel *model,
                             else lrelu_c(rb_out, (size_t)ch * next_n, 0.1f);
                             conv1d_c(rb_out, ch, next_n, d2, r2b && r2b->data ? r2b->data : NULL,
                                      ch, k, 1, pad2, 1, tmp);
+#if defined(__AVX2__)
+                            {
+                                size_t vi = 0, vn = (size_t)ch * next_n;
+                                for (; vi + 8 <= vn; vi += 8) {
+                                    __m256 a = _mm256_loadu_ps(tmp + vi);
+                                    __m256 b = _mm256_loadu_ps(rb_in + vi);
+                                    _mm256_storeu_ps(tmp + vi, _mm256_add_ps(a, b));
+                                }
+                                for (; vi < vn; vi++) tmp[vi] += rb_in[vi];
+                            }
+#else
                             for (int i = 0; i < ch * next_n; i++) tmp[i] += rb_in[i];
+#endif
                             memcpy(rb_in, tmp, (size_t)ch * next_n * sizeof(float));
                         }
-                        free(tmp);
                     }
                     for (int i = 0; i < ch * next_n; i++) acc_s[i] += rb_in[i];
                     if (L == 0 && s == 0 && getenv("WUBU_DUMP_CPU")) {
@@ -1279,7 +1339,6 @@ int wubu_generator_nsf(WuBuRVCModel *model,
                         for (int q = 0; q < 8; q++) fprintf(stderr, " %.3f", acc_s[q]);
                         fprintf(stderr, "\n");
                     }
-                    free(rb_in); free(rb_out);
                 }
                 for (int i = 0; i < ch * next_n; i++) {
                     float s = 0.0f;
@@ -1287,6 +1346,7 @@ int wubu_generator_nsf(WuBuRVCModel *model,
                         s += acc[(size_t)st * ch * next_n + i];
                     stage[L][i] = s / (float)n_stacks;
                 }
+                free(pool_in); free(pool_out); free(pool_tmp);
                 if (profiling) t_mrf += omp_get_wtime() - t_m0;
                 if (L == 0 && getenv("WUBU_DUMP_CPU")) {
                     fprintf(stderr, "CPUM0B");

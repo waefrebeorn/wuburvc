@@ -16,7 +16,24 @@ import os
 import subprocess
 import sys
 
-WV_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "out", "WordVoice")
+# WordVoice repo location: check env override, then sibling media repo, then
+# local out/WordVoice. The model checkpoints live in the media repo
+# (WuBuMedia/out/WordVoice) — wuburvc itself only has the tools + engine.
+def _find_wv_dir():
+    env = os.environ.get("WUBU_WV_DIR")
+    if env and os.path.isdir(env):
+        return env
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(here, "..", "..", "WuBuMedia", "out", "WordVoice"),
+        os.path.join(here, "..", "out", "WordVoice"),
+    ]
+    for c in candidates:
+        if os.path.isdir(os.path.join(c, "CosyVoice")):
+            return c
+    return candidates[0]
+
+WV_DIR = _find_wv_dir()
 sys.path.insert(0, WV_DIR)
 sys.path.insert(0, os.path.join(WV_DIR, "CosyVoice"))
 sys.path.insert(0, os.path.join(WV_DIR, "CosyVoice", "third_party", "Matcha-TTS"))
@@ -49,12 +66,33 @@ def _init_models():
                               fp16=True)
     _INIT_DONE[0] = True
 
+# Model + CLI locations: RVC models live in the media repo (WuBuMedia/models)
+# alongside the WordVoice checkpoints; the engine + tools live in wuburvc.
+MEDIA_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "WuBuMedia"))
+if not os.path.isdir(os.path.join(MEDIA_ROOT, "models")):
+    MEDIA_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+
+def _find_cli():
+    """Resolve the C11 RVC CLI: prefer the current engine build, fall back to
+    any existing build/wubu_rvc*.exe. Runs from the wuburvc repo root."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    candidates = ["build/wubu_rvc_vk.exe.exe", "build/wubu_rvc_vk.exe",
+                  "build/wubu_rvc_fast.exe", "build/wubu_rvc_cli.exe"]
+    for c in candidates:
+        if os.path.isfile(os.path.join(root, c)):
+            return os.path.join(root, c)
+    return os.path.join(root, candidates[0])
+
+CLI_DEFAULT = _find_cli()
+
+WUBU_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 VOICE_ALIASES = {
-    "cartman": "models/rvc/cartman/EricCartmanV1_e650_s10400.pth",
-    "bart": "models/rvc/bart/BartSimpsonKLM41.pth",
-    "freddie": "models/rvc/freddie/FM_FALSETTOS_400e_7200s.pth",
-    "mj": "models/rvc/mj/MJInvincibleEra.pth",
-    "jackblack": "models/rvc/jackblack/jackblackrvc_e1860_s87420.pth",
+    "cartman": os.path.join(MEDIA_ROOT, "models/rvc/cartman/EricCartmanV1_e650_s10400.pth"),
+    "bart": os.path.join(MEDIA_ROOT, "models/rvc/bart/BartSimpsonKLM41.pth"),
+    "freddie": os.path.join(MEDIA_ROOT, "models/rvc/freddie/FM_FALSETTOS_400e_7200s.pth"),
+    "mj": os.path.join(MEDIA_ROOT, "models/rvc/mj/MJInvincibleEra.pth"),
+    "jackblack": os.path.join(MEDIA_ROOT, "models/rvc/jackblack/jackblackrvc_e1860_s87420.pth"),
 }
 
 # Each joke: list of (text_with_tags, control_dict) — inline tags carry the
@@ -83,11 +121,20 @@ PROMPT_SPEECH = os.path.join(WV_DIR, "demo", "prompt_speech_en.mp3")
 
 def convert(cli, joke_wav, model_pth, out_wav):
     model_dir = os.path.dirname(model_pth)
+    hubert = os.path.join(MEDIA_ROOT, "models/rvc/hubert_weights.bin")
     cmd = [cli, joke_wav, model_dir, out_wav,
-           "--model", model_pth, "--noise", "0.25"]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+           "--model", model_pth, "--hubert", hubert, "--noise", "0.25"]
+    # The exe needs MinGW runtime DLLs (libgomp-1.dll, libwinpthread-1.dll)
+    # from MSYS2's mingw64 bin — the tool's Python subprocess inherits the
+    # Windows-native PATH which lacks it. Prepend it explicitly.
+    env = dict(os.environ)
+    mingw = r"C:\msys64\mingw64\bin"
+    if mingw not in env.get("PATH", ""):
+        env["PATH"] = mingw + os.pathsep + env.get("PATH", "")
+    r = subprocess.run(cmd, capture_output=True, text=True, cwd=WUBU_ROOT, env=env)
     if r.returncode != 0:
-        print("RVC error:", r.stderr[-500:])
+        print("RVC error rc=%d:" % r.returncode, (r.stderr or "")[-500:] or (r.stdout or "")[-300:])
+        print("PATH at convert:", os.environ.get("PATH", "")[:400])
         return False
     return os.path.exists(out_wav)
 
@@ -97,7 +144,7 @@ def main():
     ap.add_argument("--voice", default="cartman", choices=list(VOICE_ALIASES))
     ap.add_argument("--joke", type=int, default=0)
     ap.add_argument("--out", default=None)
-    ap.add_argument("--cli", default="build/wubu_rvc_cli_fixed.exe")
+    ap.add_argument("--cli", default=CLI_DEFAULT)
     ap.add_argument("--no-rvc", action="store_true", help="skip RVC conversion")
     args = ap.parse_args()
 
@@ -108,12 +155,13 @@ def main():
 
     tts_wav = os.path.abspath("out/demo/_wordvoice_raw.wav")
     tts_p16 = os.path.abspath("out/demo/_wordvoice_p16.wav")
+    cwd_save = os.getcwd()
     os.chdir(WV_DIR)  # model paths + prompt speech are relative to the repo
     print("[1] WordVoice synthesizing with emotional control...")
     _init_models()
     wordvoice_eval(PROMPT_TEXT, PROMPT_SPEECH, tts_text, control_dict,
                    tts_wav, lan="en")
-    os.chdir(os.path.join("..", ".."))
+    os.chdir(cwd_save)
     print(f"[1] TTS raw: {tts_wav} ({os.path.getsize(tts_wav)} bytes)")
 
     # WordVoice writes float32 wav (format 3) — normalize to PCM16 for the CLI

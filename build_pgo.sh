@@ -24,9 +24,12 @@ rm -f build/*.gcda build/*.gcno
 echo "=== step 2: profile run (WuBuMedia track) ==="
 WM=/c/Users/eman5/WuBuMedia
 PTH=$(ls "$WM/models/rvc/cartman/"*.pth | head -1)
-"$WM/build/wubu_rvc_pg.exe" "$WM/out/demo/album_cart_45s.wav" "$WM/models/rvc/cartman" \
-    "$WM/out/demo/pgo_prof.wav" --model "$PTH" --noise 0.33333 --jobs 4 2>&1 | grep -E "\[6\] chunked"
-ls build/*.gcda >/dev/null 2>&1 && echo "gcda collected" || echo "NO GCDA"
+# run must happen from the dir where the exe writes .gcda (build/) — cd there
+cd build
+"$WM/wuburvc_pg.exe" "$WM/out/demo/album_cart_45s.wav" "$WM/models/rvc/cartman" \
+    "$WM/out/demo/pgo_prof.wav" --model "$PTH" --noise 0.33333 --jobs 4 2>&1 | grep -E "\[6\] chunked" || true
+cd ..
+ls build/*.gcda >/dev/null 2>&1 && echo "gcda collected: $(ls build/*.gcda | wc -l)" || echo "NO GCDA"
 
 echo "=== step 3: profile-use ==="
 "$GCC" $COMMON -fprofile-use -fprofile-correction src/wubu_rvc_cli.c $RVC_SRCS build/wubu_rvc_cuda.o \

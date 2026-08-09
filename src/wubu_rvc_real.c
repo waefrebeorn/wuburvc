@@ -1285,6 +1285,12 @@ int wubu_generator_nsf(WuBuRVCModel *model,
             fclose(df);
             fprintf(stderr, "[dump] c_gen_input.npy (%d x %d)\n", inter_channels, nF);
         }
+        /* Triton parity hook: nsff0 (f0 per frame) + g (speaker embedding) */
+        df = fopen("outputs/rvc_ref/c_gen_nsff0.npy", "wb");
+        if (df) { fwrite(nsff0, sizeof(float), (size_t)nF, df); fclose(df); }
+        df = fopen("outputs/rvc_ref/c_gen_g.npy", "wb");
+        if (df) { fwrite(g, sizeof(float), 256, df); fclose(df); }
+        fprintf(stderr, "[dump] c_gen_nsff0.npy (%d) + c_gen_g.npy (256)\n", nF);
     }
     const RVCTensor *conv_pre_w = T(model, "dec.conv_pre.weight");
     const RVCTensor *conv_pre_b = T(model, "dec.conv_pre.bias");

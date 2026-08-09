@@ -1417,7 +1417,13 @@ int wubu_generator_nsf(WuBuRVCModel *model,
             int u = j % ups_total;   /* sample index within frame: 0..upp-1 */
             float phase = rad[fi] * (float)(u + 1);  /* f0/sr * (u+1) */
             if (fi > 0) phase += rad_acc[fi - 1];     /* add carry from prev frame */
-            float s = wubu_sinf_folded(2.0f * (float)M_PI * phase) * 0.1f;  /* sine_amp = 0.1 */
+            /* Gate the sin/tanh on fast-math like every other stage: in
+             * default mode (fast_math=0) the sine must be libm sinf/tanhf
+             * so CPU == VK == PyTorch reference. The un-gated folded poly
+             * was a 0.0238 maxdiff on the sine dump (CPU vs VK corr 0.9944
+             * instead of 1.0). */
+            float s = (wubu_get_fast_math() ? wubu_sinf_folded(2.0f * (float)M_PI * phase)
+                                            : sinf(2.0f * (float)M_PI * phase)) * 0.1f;  /* sine_amp = 0.1 */
             float sv = (nsff0[fi] > 0) ? 1.0f : 0.0f;  /* uv mask */
             /* Phase 4 improvement: noise injection in NSF sine generation.
              * PyTorch SineGen injects uniform noise in unvoiced regions:
@@ -1427,11 +1433,15 @@ int wubu_generator_nsf(WuBuRVCModel *model,
             float noise_amp = inject_noise ? (1.0f - sv) * 0.1f / 3.0f : 0.0f;
             float noise = noise_amp * wubu_rand_uniform(-1.0f, 1.0f);
             float sw = s * sv + noise;                     /* sine * uv + noise * (1-uv) */
-            sine[j] = wubu_fasttanh(linw * sw + linb);             /* l_linear + tanh */
+            sine[j] = (wubu_get_fast_math() ? wubu_fasttanh(linw * sw + linb)
+                                            : tanhf(linw * sw + linb));  /* l_linear + tanh */
         }
         free(carry); free(rad_acc); free(rad);
     }
     if (getenv("WUBU_RVC_DUMP")) {
+        fprintf(stderr, "[dump] about to write c_gen_sine.npy (%d samples) nF=%d ups_total=%d f0[0]=%.3f f0[1]=%.3f f0[nF-1]=%.3f\n",
+                n_sine, nF, ups_total,
+                nsff0[0], nF > 1 ? nsff0[1] : 0.0f, nF > 1 ? nsff0[nF-1] : 0.0f);
         FILE *df = fopen("outputs/rvc_ref/c_gen_sine.npy", "wb");
         if (df) { fwrite(sine, sizeof(float), (size_t)n_sine, df); fclose(df); }
     }
@@ -1954,6 +1964,9 @@ int wubu_rvc_synthesize_real_vk(WuBuRVCModel *model,
     }
     pthread_mutex_lock(&g_vk_mu);
     if (!g_vk) g_vk = wubu_vk_create();
+    if (getenv("WUBU_VK_DUMP")) {
+        fprintf(stderr, "[vkg] after create g_vk=%p\n", (void*)g_vk);
+    }
     int n_out = -1;
     if (g_vk)
         n_out = wubu_vk_generator_nsf(g_vk, model, z, n_frames, inter, nsff0, g,

@@ -512,6 +512,10 @@ int wubu_vk_generator_nsf(WuBuVk *vk, WuBuRVCModel *model,
                           int inject_noise, int use_snake) {
     (void)g;
     if (!vk || !model || !z || !out_audio) return -1;
+    if (getenv("WUBU_VK_DUMP"))
+        fprintf(stderr, "[vkg] generator_nsf entered nF=%d inter=%d ups_total=%d\n",
+                nF, inter_channels,
+                model->n_upsample_layers > 0 ? model->n_upsample_layers : 4);
 
     int n_ups = model->n_upsample_layers > 0 ? model->n_upsample_layers : 4;
     const RVCTensor *pre_w0 = wubu_rvc_find_tensor(model, "dec.conv_pre.weight");
@@ -614,8 +618,13 @@ int wubu_vk_generator_nsf(WuBuVk *vk, WuBuRVCModel *model,
     /* sine excitation (host, exact CPU formula) */
     {
         float sr = model->sample_rate > 0 ? (float)model->sample_rate : 40000.0f;
-        const RVCTensor *linw = wubu_rvc_find_tensor(model, "dec.sine_linear.weight");
-        const RVCTensor *linb = wubu_rvc_find_tensor(model, "dec.sine_linear.bias");
+        /* CRITICAL: the real tensor is dec.m_source.l_linear.* — the old
+         * "dec.sine_linear.*" name doesn't exist in RVC models, so linw
+         * fell back to 1.0. For Cartman l_linear.weight = -0.817383, so the
+         * sine came out UN-inverted while the CPU path (which reads the real
+         * tensor) was flipped → corr -0.994, maxdiff 0.20 on the sine dump. */
+        const RVCTensor *linw = wubu_rvc_find_tensor(model, "dec.m_source.l_linear.weight");
+        const RVCTensor *linb = wubu_rvc_find_tensor(model, "dec.m_source.l_linear.bias");
         float linw_v = (linw && linw->data) ? linw->data[0] : 1.0f;
         float linb_v = (linb && linb->data) ? linb->data[0] : 0.0f;
         float accum = 0.0f;
@@ -638,6 +647,11 @@ int wubu_vk_generator_nsf(WuBuVk *vk, WuBuRVCModel *model,
             float noise_amp = inject_noise ? (1.0f - uv) * 0.1f / 3.0f : 0.0f;
             float noise = noise_amp * (2.0f * ((float)rand() / RAND_MAX) - 1.0f);
             sine[j] = tanhf(linw_v * (s * uv + noise) + linb_v);
+        }
+        if (getenv("WUBU_VK_DUMP")) {
+            fprintf(stderr, "[vkg] about to write vk_sine.npy (%d samples)\\n", nF * ups_total);
+            FILE *df = fopen("outputs/rvc_ref/vk_sine.npy", "wb");
+            if (df) { fwrite(sine, sizeof(float), (size_t)nF * ups_total, df); fclose(df); }
         }
         upload(vk, 2, sine, sine_sz);
     }

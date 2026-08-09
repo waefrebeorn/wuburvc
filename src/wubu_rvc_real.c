@@ -285,12 +285,11 @@ static void conv1d_c_fused_impl(const float *in, int in_ch, int n,
     if (!resid) memset(out, 0, (size_t)out_ch * n_out * sizeof(float));
     if (out_ch >= 32) {
         /* INPUT-STATIONARY tiled conv (same structure as conv1d_c).
-         * TILE=2048: the MRF runs this at n≈8192, so each conv call has 4
-         * tiles for its 4 threads (TILE=8192 gave 1 tile → convs were serial
-         * per stack; measured 25.82 → 25.04s at jobs=4, 2026-08-09). Tiles
-         * only partition the j loop — accumulation order per output element
-         * is unchanged, so parity holds to ~1 ulp at tile boundaries. */
-        const int TILE = 2048;
+         * TILE=8192 (DO NOT change): TILE=2048 gained ~3% but changed the
+         * tile-boundary accumulation path → maxdiff=1 LSB on 100/900k
+         * samples. The boss's quality bar is BYTE-IDENTICAL output vs the
+         * reference; a 1-LSB diff is not acceptable even if inaudible. */
+        const int TILE = 8192;
 #pragma omp parallel for schedule(dynamic, 4) num_threads(omp_in_parallel() ? 4 : 12) if(n_out >= TILE)
         for (int jb = 0; jb < n_out; jb += TILE) {
             int j_hi = jb + TILE < n_out ? jb + TILE : n_out;

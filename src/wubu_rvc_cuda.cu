@@ -218,6 +218,63 @@ static void kfmt(char *o, const char *pre, int a,
     *p = 0;
 }
 
+/* ── persistent device-weight cache ────────────────────────────────────
+ * The generator re-uploads EVERY weight tensor per chunk (cudaMalloc +
+ * cudaMemcpy H2D inside the chunk loop) — for the Cleveland MRF that's
+ * ~150 MB/chunk of pure transfer. Like the Vulkan wslot() cache, upload
+ * each tensor ONCE to a resident device buffer, keyed by name; later
+ * chunks hit the cache. The device pointers stay valid for the process
+ * (CUDA context persists across generator calls). */
+#define WCAP 512
+typedef struct { char name[96]; float *d; size_t bytes; } WEntry;
+static WEntry g_wcache[WCAP];
+static int g_wn = 0;
+static int g_winit = 0;
+
+static float *wcuda(WuBuRVCModel *model, const char *name, const RVCTensor *t) {
+    if (!t || !t->data) return NULL;
+    for (int i = 0; i < g_wn; i++)
+        if (strcmp(g_wcache[i].name, name) == 0) return g_wcache[i].d;
+    if (g_wn >= WCAP) return NULL;
+    size_t bytes = tnum(t);
+    float *d = NULL;
+    if (cudaMalloc(&d, bytes) != cudaSuccess) return NULL;
+    if (cudaMemcpy(d, t->data, bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaFree(d); return NULL;
+    }
+    char *dst = g_wcache[g_wn].name;
+    const char *src = name;
+    while (*src && (size_t)(dst - g_wcache[g_wn].name) < sizeof(g_wcache[g_wn].name) - 1) *dst++ = *src++;
+    *dst = 0;
+    g_wcache[g_wn].d = d;
+    g_wcache[g_wn].bytes = bytes;
+    g_wn++;
+    g_winit = 1;
+    return d;
+}
+
+/* raw-data cache variant: for non-tensor buffers (upsample denorm float*). */
+static float *wcuda_raw(const char *name, const float *data, size_t bytes) {
+    if (!data) return NULL;
+    for (int i = 0; i < g_wn; i++)
+        if (strcmp(g_wcache[i].name, name) == 0) return g_wcache[i].d;
+    if (g_wn >= WCAP) return NULL;
+    float *d = NULL;
+    if (cudaMalloc(&d, bytes) != cudaSuccess) return NULL;
+    if (cudaMemcpy(d, data, bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaFree(d); return NULL;
+    }
+    char *dst = g_wcache[g_wn].name;
+    const char *src = name;
+    while (*src && (size_t)(dst - g_wcache[g_wn].name) < sizeof(g_wcache[g_wn].name) - 1) *dst++ = *src++;
+    *dst = 0;
+    g_wcache[g_wn].d = d;
+    g_wcache[g_wn].bytes = bytes;
+    g_wn++;
+    g_winit = 1;
+    return d;
+}
+
 /* ── the CUDA GeneratorNSF driver ────────────────────────────────────── */
 /* Mirrors wubu_generator_nsf (CPU) exactly; z is [inter, nF] col-major. */
 int wubu_generator_nsf_cuda(WuBuRVCModel *model,
@@ -274,19 +331,13 @@ int wubu_generator_nsf_cuda(WuBuRVCModel *model,
 
     {
         size_t pre_sz = (size_t)pre_w->dims[0] * pre_w->dims[1] * pre_w->dims[2];
-        float *d_prew = NULL;
-        cudaMalloc(&d_prew, pre_sz * sizeof(float));
-        cudaMemcpy(d_prew, pre_w->data, pre_sz * sizeof(float), cudaMemcpyHostToDevice);
-        float *d_preb = NULL;
-        if (pre_b && pre_b->data) {
-            cudaMalloc(&d_preb, (size_t)pre_b->dims[0] * sizeof(float));
-            cudaMemcpy(d_preb, pre_b->data, (size_t)pre_b->dims[0] * sizeof(float), cudaMemcpyHostToDevice);
-        }
+        float *d_prew = wcuda(model, "dec.conv_pre.weight", pre_w);
+        float *d_preb = pre_b && pre_b->data ? wcuda(model, "dec.conv_pre.bias", pre_b) : NULL;
+        if (!d_prew) goto fail;
         int pk = pre_w->dims[2];
         launch_conv1d(d_z, inter_channels, nF, d_prew, d_preb,
                       cur_ch, pk, 1, pk / 2, 1, d_x, cur_n, st);
         if (gpu_ck("conv_pre")) goto fail;
-        cudaFree(d_prew); cudaFree(d_preb);
     }
     cudaFree(d_z); d_z = NULL;
 
@@ -325,8 +376,8 @@ int wubu_generator_nsf_cuda(WuBuRVCModel *model,
         float *sine = (float *)malloc((size_t)n_sine * sizeof(float));
         float *rad = (float *)malloc((size_t)nF * sizeof(float));
         float *rad_acc = (float *)malloc((size_t)nF * sizeof(float));
-        const RVCTensor *linw = wubu_rvc_find_tensor(model, "dec.sine_linear.weight");
-        const RVCTensor *linb = wubu_rvc_find_tensor(model, "dec.sine_linear.bias");
+        const RVCTensor *linw = wubu_rvc_find_tensor(model, "dec.m_source.l_linear.weight");
+        const RVCTensor *linb = wubu_rvc_find_tensor(model, "dec.m_source.l_linear.bias");
         float linw_v = (linw && linw->data) ? linw->data[0] : 1.0f;
         float linb_v = (linb && linb->data) ? linb->data[0] : 0.0f;
         if (sine && rad && rad_acc) {
@@ -373,20 +424,14 @@ int wubu_generator_nsf_cuda(WuBuRVCModel *model,
         char key[256];
         kfmt(key, "dec.ups.", L, "", -1, ".bias");
         const RVCTensor *ub = wubu_rvc_find_tensor(model, key);
-        float *d_uw = NULL, *d_ub = NULL;
-        cudaMalloc(&d_uw, (size_t)den_len * sizeof(float));
-        cudaMemcpy(d_uw, den, (size_t)den_len * sizeof(float), cudaMemcpyHostToDevice);
-        if (ub && ub->data) {
-            cudaMalloc(&d_ub, tnum(ub));
-            cudaMemcpy(d_ub, ub->data, tnum(ub), cudaMemcpyHostToDevice);
-        }
+        char dkey[256];
+        kfmt(dkey, "dec.ups.", L, "", -1, ".denorm");
+        float *d_uw = wcuda_raw(dkey, den, (size_t)den_len * sizeof(float));
+        float *d_ub = ub && ub->data ? wcuda(model, key, ub) : NULL;
         if (gpu_ok(cudaMalloc(&d_tmp, (size_t)out_ch * out_n * sizeof(float)), "stage")) goto fail;
         launch_convt1d(d_cur, in_ch, in_n, d_uw, d_ub, out_ch, ups_k[L], ups_rate[L], ups_pad[L],
                        d_tmp, out_n, st);
         if (gpu_ck("ups")) goto fail;
-
-
-        cudaFree(d_uw); cudaFree(d_ub);
 
         /* noise conv: conv1d(sine [1, n_sine] -> [out_ch, out_n], stride = product of remaining) */
         {
@@ -401,13 +446,12 @@ int wubu_generator_nsf_cuda(WuBuRVCModel *model,
             if (pad < 0) pad = 0;
             if (ncw && ncw->data) {
                 int s_in = nF * ups_total;
-                float *d_ncw = NULL, *d_ncb = NULL, *d_nc = NULL;
-                cudaMalloc(&d_ncw, tnum(ncw));
-                cudaMemcpy(d_ncw, ncw->data, tnum(ncw), cudaMemcpyHostToDevice);
-                if (ncb && ncb->data) {
-                    cudaMalloc(&d_ncb, tnum(ncb));
-                    cudaMemcpy(d_ncb, ncb->data, tnum(ncb), cudaMemcpyHostToDevice);
-                }
+                char nk1[256], nk2[256];
+                kfmt(nk1, "dec.noise_convs.", L, "", -1, ".weight");
+                kfmt(nk2, "dec.noise_convs.", L, "", -1, ".bias");
+                float *d_ncw = wcuda(model, nk1, ncw);
+                float *d_ncb = ncb && ncb->data ? wcuda(model, nk2, ncb) : NULL;
+                float *d_nc = NULL;
                 cudaMalloc(&d_nc, (size_t)out_ch * out_n * sizeof(float));
                 launch_conv1d(d_sine, 1, s_in, d_ncw, d_ncb, out_ch, kk, stride, pad, 1,
                               d_nc, out_n, st);
@@ -419,7 +463,7 @@ int wubu_generator_nsf_cuda(WuBuRVCModel *model,
                 cudaLaunchKernel((void *)k_add, dim3((unsigned)((n2 + th - 1) / th)), dim3((unsigned)th), args, 0, st);
         cudaStreamSynchronize(st);
         if (gpu_ck("noise-add-sync")) goto fail;
-                cudaFree(d_ncw); cudaFree(d_ncb); cudaFree(d_nc);
+                cudaFree(d_nc);
             }
         }
 
@@ -475,19 +519,16 @@ int wubu_generator_nsf_cuda(WuBuRVCModel *model,
                     if (dil <= 0) dil = 1 + 2 * cp;
                     int pad1 = dil * (k - 1) / 2;
                     int pad2 = k / 2;
-                    float *d_c1 = NULL, *d_c2 = NULL, *d_c1b = NULL, *d_c2b = NULL;
-                    cudaMalloc(&d_c1, tnum(r1v));
-                    cudaMalloc(&d_c2, tnum(r2v));
-                    cudaMemcpy(d_c1, r1v->data, tnum(r1v), cudaMemcpyHostToDevice);
-                    cudaMemcpy(d_c2, r2v->data, tnum(r2v), cudaMemcpyHostToDevice);
-                    if (r1b && r1b->data) {
-                        cudaMalloc(&d_c1b, tnum(r1b));
-                        cudaMemcpy(d_c1b, r1b->data, tnum(r1b), cudaMemcpyHostToDevice);
-                    }
-                    if (r2b && r2b->data) {
-                        cudaMalloc(&d_c2b, tnum(r2b));
-                        cudaMemcpy(d_c2b, r2b->data, tnum(r2b), cudaMemcpyHostToDevice);
-                    }
+                    char k1[256], k2[256], k3[256], k4[256];
+                    kfmt(k1, "dec.resblocks.", rb, ".convs1.", cp, ".weight_v");
+                    kfmt(k2, "dec.resblocks.", rb, ".convs2.", cp, ".weight_v");
+                    kfmt(k3, "dec.resblocks.", rb, ".convs1.", cp, ".bias");
+                    kfmt(k4, "dec.resblocks.", rb, ".convs2.", cp, ".bias");
+                    float *d_c1 = wcuda(model, k1, r1v);
+                    float *d_c2 = wcuda(model, k2, r2v);
+                    float *d_c1b = r1b && r1b->data ? wcuda(model, k3, r1b) : NULL;
+                    float *d_c2b = r2b && r2b->data ? wcuda(model, k4, r2b) : NULL;
+                    if (!d_c1 || !d_c2) goto fail;
                     /* x = act(rb_in); conv1; act; conv2; + rb_in */
                     launch_act(d_tmp2, n2, use_snake, st);
                     launch_conv1d(d_tmp2, ch, out_n, d_c1, d_c1b, ch, k, 1, pad1, dil,
@@ -509,7 +550,6 @@ int wubu_generator_nsf_cuda(WuBuRVCModel *model,
                     cudaLaunchKernel((void *)k_copy, dim3((unsigned)((n2 + th - 1) / th)), dim3((unsigned)th), args_c2, 0, st);
                     if (gpu_ck("mrf-carry")) goto fail;
         if (gpu_ck("add")) goto fail;
-                    cudaFree(d_c1); cudaFree(d_c2); cudaFree(d_c1b); cudaFree(d_c2b);
                 }
                 /* acc[s] += rb_in (d_tmp2) */
                 float *d_acc_s = d_acc + (size_t)s * ch * out_n;
@@ -561,13 +601,11 @@ int wubu_generator_nsf_cuda(WuBuRVCModel *model,
         int out_n = cur_n;
         if (out_n > max_samples) out_n = max_samples;
         launch_act(d_cur, (size_t)post_in * cur_n, use_snake, st);
-        float *d_pw = NULL;
-        cudaMalloc(&d_pw, tnum(post_w));
-        cudaMemcpy(d_pw, post_w->data, tnum(post_w), cudaMemcpyHostToDevice);
+        float *d_pw = wcuda(model, "dec.conv_post.weight", post_w);
+        if (!d_pw) goto fail;
         launch_conv1d(d_cur, post_in, cur_n, d_pw, NULL, 1, post_k, 1, post_pad, 1,
                       d_out, out_n, st);
         if (gpu_ck("post")) goto fail;
-        cudaFree(d_pw);
         launch_unary(d_out, (size_t)out_n, (void *)k_tanh, st);
         cudaStreamSynchronize(st);
         if (gpu_ck("tanh")) goto fail;

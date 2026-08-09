@@ -85,4 +85,40 @@ int wubu_vk_bwd_act(WuBuVk *vk, const float *x, const float *dout,
 int wubu_vk_act(WuBuVk *vk, float *x, const float *o, int mode,
                 int n_ch, int n, float sc);
 
+/* ── record-mode training API ──
+ * wubu_vk_train_begin drains the queue, resets the descriptor pool, and
+ * enters record mode (all subsequent train_* ops record into ONE command
+ * buffer; nothing is submitted). wubu_vk_train_end submits once + waits.
+ * Slots are numbered WUBU_VK_TRAIN_BASE+n (n<400) and owned by the caller.
+ * upload/zero/download are host-mapped before the submit; conv/act/elt/bwd
+ * record dispatches referencing slots. */
+#define WUBU_VK_TRAIN_BASE 200   /* training slot region start (pool 800) */
+int  wubu_vk_train_begin(WuBuVk *vk);
+int  wubu_vk_train_end(WuBuVk *vk);
+int  wubu_vk_train_upload(WuBuVk *vk, int slot, const void *data, size_t sz);
+int  wubu_vk_train_zero(WuBuVk *vk, int slot, size_t sz);
+int  wubu_vk_train_download(WuBuVk *vk, int slot, void *out, size_t sz);
+/* ensure a training slot exists (DEVICE_LOCAL-only) — used by the caller for
+ * GPU-side zeroing before any record op touches the slot. */
+int  wubu_vk_train_slot(WuBuVk *vk, int slot, size_t sz);
+/* GPU-side zero of a train slot (recorded; call between train_begin/end). */
+void wubu_vk_train_fill_zero(WuBuVk *vk, int slot, size_t n);
+void wubu_vk_train_conv1d(WuBuVk *vk, int in_s, int w_s, int b_s, int out_s,
+                          int in_ch, int n, int out_ch, int k, int stride,
+                          int pad, int dil, int n_out, int is_convt, int epi);
+void wubu_vk_train_act(WuBuVk *vk, int x_s, int o_s, int mode,
+                       int n_ch, int n, float sc);
+void wubu_vk_train_elt(WuBuVk *vk, int a_s, size_t a_off, int b_s, size_t b_off,
+                       int mode, size_t n);
+void wubu_vk_train_bwd_conv1d(WuBuVk *vk, int in_s, int w_s, int dout_s,
+                              int din_s, int dw_s, int db_s,
+                              int in_ch, int out_ch, int k, int stride,
+                              int pad, int dil, int n_in, int n_out);
+void wubu_vk_train_bwd_convt1d(WuBuVk *vk, int in_s, int w_s, int dout_s,
+                               int din_s, int dw_s, int db_s,
+                               int in_ch, int out_ch, int k, int stride,
+                               int pad, int n_in, int n_out);
+void wubu_vk_train_bwd_act(WuBuVk *vk, int x_s, int dout_s, int din_s,
+                           int mode, size_t n);
+
 #endif /* WUBU_VK_H */

@@ -49,8 +49,9 @@ static void kfmt(char *o, const char *pre, int a,
     *p = 0;
 }
 
-#define WUBU_VK_POOL 200
+#define WUBU_VK_POOL 900
 #define WUBU_VK_ZERO_SLOT 199   /* reserved: persistent GPU zero buffer — wslot() must never allocate it */
+#define WUBU_VK_TRAIN_BASE 200  /* training record-mode slots start here (pool 900: 200..899) */
 
 struct WuBuVk {
     VkInstance inst;
@@ -109,6 +110,12 @@ struct WuBuVk {
     VkDeviceSize poff[WUBU_VK_POOL];   /* map offset (allocator alignment) */
     VkDeviceSize psize[WUBU_VK_POOL];  /* actual allocation size */
     uint32_t pflags[WUBU_VK_POOL];     /* memory type property flags (coherency) */
+    uint32_t mp_type_count;             /* cached memory-type count */
+    VkMemoryPropertyFlags mtypes[32];   /* cached per-type property flags */
+    /* deferred frees: with pipelined submits a slot can GROW while a submit
+     * still references the old buffer — defer destroy until the queue is
+     * idle (train_end / generator end) to avoid use-after-free. */
+    VkBuffer defer_buf[256]; VkDeviceMemory defer_mem[256]; int defer_n;
     /* conv1d public API uses slot 0/1/2/3 */
     size_t cap_in, cap_w, cap_b, cap_out;
     /* weight-preload cache: upload each generator tensor ONCE at first use and
@@ -156,28 +163,78 @@ static int pick_mem_type(WuBuVk *vk, uint32_t type_bits, uint32_t *out_idx) {
     return -1;
 }
 
-/* slot allocation: grow on demand; slot 0..3 are the public conv API. */
-static int pool_slot(WuBuVk *vk, int idx, size_t need) {
+/* slot allocation: grow on demand; slot 0..3 are the public conv API.
+ * dev_only=1: prefer DEVICE_LOCAL without HOST_VISIBLE (GPU-only buffers —
+ * no host upload/download). Training intermediates use this to avoid
+ * exhausting the PCIe BAR window; weights/grads (host-touched) stay
+ * DEVICE_LOCAL|HOST_VISIBLE. */
+static int mp_type_count(WuBuVk *vk) {
+    return vk->mp_type_count;
+}
+
+static int pool_slot_mem(WuBuVk *vk, int idx, size_t need, int dev_only) {
     if (idx < 0 || idx >= WUBU_VK_POOL) return -1;
     if (getenv("WUBU_POOL_DBG")) fprintf(stderr, "POOL idx=%d need=%zu cur=%zu buf=%p\n", idx, need, vk->pcap[idx], (void*)vk->buffers[idx]);
     if (vk->buffers[idx] != VK_NULL_HANDLE && vk->pcap[idx] >= need) return 0;
     if (getenv("WUBU_POOL_DBG")) fprintf(stderr, "POOL grow idx=%d need=%zu\n", idx, need);
     if (vk->buffers[idx] != VK_NULL_HANDLE) {
-        vkDestroyBuffer(vk->dev, vk->buffers[idx], NULL);
-        vkFreeMemory(vk->dev, vk->pmem[idx], NULL);
+        if (vk->pipe_submit && vk->defer_n < 256) {
+            /* pipelined submits may still read this buffer — defer the
+             * destroy until the queue is idle (train_end / generator end). */
+            vk->defer_buf[vk->defer_n] = vk->buffers[idx];
+            vk->defer_mem[vk->defer_n] = vk->pmem[idx];
+            vk->defer_n++;
+            vk->buffers[idx] = VK_NULL_HANDLE;
+            vk->pmem[idx] = VK_NULL_HANDLE;
+            vk->pcap[idx] = 0;
+        } else {
+            vkDestroyBuffer(vk->dev, vk->buffers[idx], NULL);
+            vkFreeMemory(vk->dev, vk->pmem[idx], NULL);
+        }
     }
     VkBufferCreateInfo bci = { .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
                                .size = need ? need : 16,
-                               .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                               .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
-    if (vkCreateBuffer(vk->dev, &bci, NULL, &vk->buffers[idx]) != VK_SUCCESS) return -1;
+    if (vkCreateBuffer(vk->dev, &bci, NULL, &vk->buffers[idx]) != VK_SUCCESS) {
+        if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG pool_slot vkCreateBuffer FAIL idx=%d need=%zu\n", idx, need);
+        return -1;
+    }
     VkMemoryRequirements mr;
     vkGetBufferMemoryRequirements(vk->dev, vk->buffers[idx], &mr);
     uint32_t mi = 0;
-    if (pick_mem_type(vk, mr.memoryTypeBits, &mi) != 0) return -1;
+    /* PASS 1: desired type */
+    int found = 0;
+    if (!dev_only) {
+        for (uint32_t i = 0; i < mp_type_count(vk); i++) {
+            if ((mr.memoryTypeBits & (1u << i)) &&
+                (vk->mtypes[i] & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+                (vk->mtypes[i] & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+                mi = i; found = 1; break;
+            }
+        }
+    } else {
+        for (uint32_t i = 0; i < mp_type_count(vk); i++) {
+            if ((mr.memoryTypeBits & (1u << i)) &&
+                (vk->mtypes[i] & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) &&
+                !(vk->mtypes[i] & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+                mi = i; found = 1; break;
+            }
+        }
+    }
+    if (!found) {
+        if (pick_mem_type(vk, mr.memoryTypeBits, &mi) != 0) {
+            if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG pool_slot pick_mem_type FAIL idx=%d\n", idx);
+            return -1;
+        }
+    }
     VkMemoryAllocateInfo mai = { .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
                                  .allocationSize = mr.size, .memoryTypeIndex = mi };
-    if (vkAllocateMemory(vk->dev, &mai, NULL, &vk->pmem[idx]) != VK_SUCCESS) return -1;
+    if (vkAllocateMemory(vk->dev, &mai, NULL, &vk->pmem[idx]) != VK_SUCCESS) {
+        if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG pool_slot vkAllocateMemory FAIL idx=%d size=%llu\n",
+                idx, (unsigned long long)mr.size);
+        return -1;
+    }
     vkBindBufferMemory(vk->dev, vk->buffers[idx], vk->pmem[idx], 0);
     vk->pcap[idx] = need;
     vk->poff[idx] = 0;
@@ -188,14 +245,29 @@ static int pool_slot(WuBuVk *vk, int idx, size_t need) {
     return 0;
 }
 
+static int pool_slot(WuBuVk *vk, int idx, size_t need) {
+    return pool_slot_mem(vk, idx, need, 0);
+}
+static int pool_slot_dev(WuBuVk *vk, int idx, size_t need) {
+    return pool_slot_mem(vk, idx, need, 1);
+}
+
 static int mem_coherent(WuBuVk *vk, int slot) {
     return (vk->pflags[slot] & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) != 0;
 }
 
 static void upload(WuBuVk *vk, int slot, const void *data, size_t sz) {
     if (getenv("WUBU_POOL_DBG")) fprintf(stderr, "UPLOAD slot=%d sz=%zu psize=%zu\n", slot, sz, vk->psize[slot]);
+    if (slot < 0 || slot >= WUBU_VK_POOL || !vk->pmem[slot]) {
+        if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG upload BAD pmem slot=%d sz=%zu psize=%zu buf=%p\n",
+                slot, sz, vk->psize[slot], (void*)vk->buffers[slot]);
+        return;
+    }
     void *p = NULL;
-    vkMapMemory(vk->dev, vk->pmem[slot], 0, vk->psize[slot], 0, &p);
+    VkResult mr = vkMapMemory(vk->dev, vk->pmem[slot], 0, vk->psize[slot], 0, &p);
+    if (getenv("WUBU_VK_DBG") && mr != VK_SUCCESS)
+        fprintf(stderr, "VKDBG upload MAPFAIL slot=%d sz=%zu psize=%zu mr=%d pflags=0x%x\n",
+                slot, sz, vk->psize[slot], (int)mr, vk->pflags[slot]);
     if (data) memcpy(p, data, sz); else memset(p, 0, sz);
     if (!mem_coherent(vk, slot)) {
         VkMappedMemoryRange r = { .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
@@ -212,7 +284,6 @@ static void upload(WuBuVk *vk, int slot, const void *data, size_t sz) {
  * single-buffer (no_flush) path safe: no later upload() can clobber a slot a
  * previously-recorded dispatch references. Returns the slot or -1. */
 static int wslot(WuBuVk *vk, const char *name, const void *data, size_t sz) {
-    if (!vk || !name) return -1;
     for (int i = 0; i < vk->wn; i++) {
         if (strcmp(vk->wcache[i].name, name) == 0) return vk->wcache[i].slot;
     }
@@ -349,7 +420,8 @@ static void rec_flush(WuBuVk *vk) {
     }
     if (getenv("WUBU_VK_DBG") && (sr != VK_SUCCESS))
         fprintf(stderr, "VKDBG flush err submit=%d\n", (int)sr);
-    if (getenv("WUBU_VK_DBG") && vk->last_written >= 0 && vk->pmem[vk->last_written]) {
+    if (getenv("WUBU_VK_DBG") && vk->last_written >= 0 && vk->pmem[vk->last_written] &&
+        (vk->pflags[vk->last_written] & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
         float v0 = 0.0f;
         void *p = NULL;
         vkMapMemory(vk->dev, vk->pmem[vk->last_written], 0, 4, 0, &p);
@@ -367,8 +439,12 @@ static void rec_flush(WuBuVk *vk) {
     VkCommandBuffer next = vk->cb;
     if (vk->pipe_submit) {
         int tslot = (vk->cb_ring_n + 1) % 8;
+        if (getenv("WUBU_VK_DBG"))
+            fprintf(stderr, "VKDBG ring: cb_ring_n=%d tslot=%d fence[%d]=%p\n",
+                    vk->cb_ring_n, tslot, tslot, (void*)vk->cb_fence[tslot]);
         if (vk->cb_fence[tslot] != VK_NULL_HANDLE) {
-            vkWaitForFences(vk->dev, 1, &vk->cb_fence[tslot], VK_TRUE, UINT64_MAX);
+            VkResult fw = vkWaitForFences(vk->dev, 1, &vk->cb_fence[tslot], VK_TRUE, UINT64_MAX);
+            if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG ring: waited fence[%d] rc=%d\n", tslot, (int)fw);
             vkResetFences(vk->dev, 1, &vk->cb_fence[tslot]);
         }
         vk->cb_ring_n = tslot;
@@ -550,6 +626,13 @@ WuBuVk *wubu_vk_create(void) {
     VkPhysicalDevice *devs = (VkPhysicalDevice *)calloc(n, sizeof(VkPhysicalDevice));
     vkEnumeratePhysicalDevices(vk->inst, &n, devs);
     vk->phys = devs[0];
+    {
+        VkPhysicalDeviceMemoryProperties mpc;
+        vkGetPhysicalDeviceMemoryProperties(vk->phys, &mpc);
+        vk->mp_type_count = mpc.memoryTypeCount;
+        for (uint32_t i = 0; i < mpc.memoryTypeCount && i < 32; i++)
+            vk->mtypes[i] = mpc.memoryTypes[i].propertyFlags;
+    }
     if (getenv("WUBU_VK_DBG")) {
         VkPhysicalDeviceProperties pdp;
         vkGetPhysicalDeviceProperties(vk->phys, &pdp);
@@ -627,6 +710,11 @@ void wubu_vk_destroy(WuBuVk *vk) {
     if (!vk) return;
     if (vk->dev) {
         vkQueueWaitIdle(vk->q);
+        for (int i = 0; i < vk->defer_n; i++) {
+            if (vk->defer_buf[i]) vkDestroyBuffer(vk->dev, vk->defer_buf[i], NULL);
+            if (vk->defer_mem[i]) vkFreeMemory(vk->dev, vk->defer_mem[i], NULL);
+        }
+        vk->defer_n = 0;
         for (int i = 0; i < WUBU_VK_POOL; i++) {
             if (vk->buffers[i]) vkDestroyBuffer(vk->dev, vk->buffers[i], NULL);
             if (vk->pmem[i]) vkFreeMemory(vk->dev, vk->pmem[i], NULL);
@@ -961,6 +1049,191 @@ int wubu_vk_act(WuBuVk *vk, float *x, const float *o, int mode,
     vkQueueWaitIdle(vk->q);
     download(vk, 4, x, sz);
     return 0;
+}
+
+/* ── record-mode training API ────────────────────────────────────────
+ * The per-op public bwd/conv APIs round-trip every buffer over PCIe per
+ * dispatch (measured: ~2 min per training step at F=96). Training instead
+ * records ALL dispatches into ONE command buffer (weights + intermediates
+ * stay in GPU slots 200+), submits once, and downloads only the final
+ * grads. Same math, same shaders — different sync granularity.
+ *
+ * Slot contract (wubu_train_vk.c owns the numbering):
+ *   slot = WUBU_VK_TRAIN_BASE + n, n < 400. pool_slot grows on demand.
+ *
+ * begin: drain queue, reset descriptor pool (1024-set cap per step — the
+ * per-step dispatch count is ~300), enter record mode (no_flush).
+ * end:   submit once + waitIdle, exit record mode. */
+
+int wubu_vk_train_begin(WuBuVk *vk) {
+    if (!vk) return -1;
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG train_begin: drain\n");
+    vkQueueWaitIdle(vk->q);                 /* drain previous step */
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG train_begin: drained\n");
+    if (vk->dspool) {                       /* fresh descriptor pool per step */
+        vkResetDescriptorPool(vk->dev, vk->dspool, 0);
+        vk->dspool_n = 0;
+    }
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG train_begin: dspool reset\n");
+    /* Use the generator's proven pipelined path: no_flush=0 (each op ends +
+     * submits), pipe_submit=1 (submit WITHOUT waiting, ring cb + fence sync).
+     * The submit boundary is the sync between dispatches — the single-buffer
+     * (no_flush=1) barrier mode is NOT reliable on this NVIDIA driver.
+     *
+     * CRITICAL: do NOT reset cb_ring_n here. The ring's fence chain is
+     * mid-cycle (the previous step's last op waited+reset the NEXT slot's
+     * fence). Resetting cb_ring_n=0 would make the first fence wait of the
+     * new step target a reset-but-never-rearmed fence → deadlock. Continuing
+     * the cycle re-arms that fence via the first submit. */
+    vk->no_flush = 0;
+    vk->pipe_submit = 1;
+    vk->cb = vk->cb_ring[vk->cb_ring_n % 8];
+    VkCommandBufferBeginInfo cbbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    vkBeginCommandBuffer(vk->cb, &cbbi);
+    return 0;
+}
+
+int wubu_vk_train_end(WuBuVk *vk) {
+    if (!vk) return -1;
+    /* the last op already submitted via rec_flush (ring); wait everything */
+    vkQueueWaitIdle(vk->q);
+    /* safe to destroy grown-away buffers now */
+    for (int i = 0; i < vk->defer_n; i++) {
+        if (vk->defer_buf[i]) vkDestroyBuffer(vk->dev, vk->defer_buf[i], NULL);
+        if (vk->defer_mem[i]) vkFreeMemory(vk->dev, vk->defer_mem[i], NULL);
+    }
+    vk->defer_n = 0;
+    vk->no_flush = 0;
+    vk->pipe_submit = 0;
+    /* do NOT reset cb_ring_n — the fence chain is mid-cycle; the next
+     * train_begin continues from here (see train_begin comment) */
+    return 0;
+}
+
+/* upload/zero/download into a train slot (host-mapped, before submit) */
+int wubu_vk_train_upload(WuBuVk *vk, int slot, const void *data, size_t sz) {
+    if (!vk || slot < WUBU_VK_TRAIN_BASE || slot >= WUBU_VK_POOL) {
+        if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG train_upload OUT-OF-RANGE slot=%d\n", slot);
+        return -1;
+    }
+    if (pool_slot(vk, slot, sz)) {
+        if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG train_upload pool_slot FAIL slot=%d sz=%zu\n", slot, sz);
+        return -1;
+    }
+    upload(vk, slot, data, sz);
+    return 0;
+}
+
+int wubu_vk_train_zero(WuBuVk *vk, int slot, size_t sz) {
+    if (!vk || slot < WUBU_VK_TRAIN_BASE || slot >= WUBU_VK_POOL) {
+        if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG train_zero OUT-OF-RANGE slot=%d\n", slot);
+        return -1;
+    }
+    if (pool_slot(vk, slot, sz)) {
+        if (getenv("WUBU_VK_DBG")) {
+            size_t tot_hv = 0;
+            for (int i = 0; i < WUBU_VK_POOL; i++)
+                if (vk->pmem[i] && (vk->pflags[i] & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
+                    tot_hv += vk->psize[i];
+            fprintf(stderr, "VKDBG train_zero pool_slot FAIL slot=%d sz=%zu hv_total=%zu\n", slot, sz, tot_hv);
+        }
+        return -1;
+    }
+    upload(vk, slot, NULL, sz);
+    return 0;
+}
+
+int wubu_vk_train_download(WuBuVk *vk, int slot, void *out, size_t sz) {
+    if (!vk || slot < WUBU_VK_TRAIN_BASE || slot >= WUBU_VK_POOL) return -1;
+    download(vk, slot, out, sz);
+    return 0;
+}
+
+int wubu_vk_train_slot(WuBuVk *vk, int slot, size_t sz) {
+    if (!vk || slot < WUBU_VK_TRAIN_BASE || slot >= WUBU_VK_POOL) return -1;
+    return pool_slot_dev(vk, slot, sz);
+}
+
+/* GPU-side zero of a train slot (recorded; call between train_begin/end).
+ * Works for DEVICE_LOCAL-only slots host memset cannot touch. */
+void wubu_vk_train_fill_zero(WuBuVk *vk, int slot, size_t n) {
+    if (!vk || slot < WUBU_VK_TRAIN_BASE || slot >= WUBU_VK_POOL) return;
+    if (wubu_vk_train_slot(vk, slot, n * 4)) return;
+    rec_sync(vk);
+    vkCmdFillBuffer(vk->cb, vk->buffers[slot], 0, n * 4, 0u);
+    vk->last_written = slot;
+    rec_flush(vk);
+}
+
+/* record-only ops (call AFTER wubu_vk_train_begin) — each one ensures the
+ * referenced slots exist (pool_slot grows on demand). GPU-only intermediates
+ * (the out slots of conv/act/elt and MRF caches) use DEVICE_LOCAL memory to
+ * avoid exhausting the PCIe BAR; weight/grad/in/dout slots (host-touched)
+ * stay DEVICE_LOCAL|HOST_VISIBLE. */
+void wubu_vk_train_conv1d(WuBuVk *vk, int in_s, int w_s, int b_s, int out_s,
+                          int in_ch, int n, int out_ch, int k, int stride,
+                          int pad, int dil, int n_out, int is_convt, int epi) {
+    size_t in_sz = (size_t)in_ch * n * 4;
+    size_t w_sz = (size_t)(is_convt ? in_ch * out_ch : out_ch * in_ch) * k * 4;
+    size_t b_sz = (size_t)out_ch * 4;
+    size_t out_sz = (size_t)out_ch * n_out * 4;
+    pool_slot(vk, in_s, in_sz); pool_slot(vk, w_s, w_sz);
+    pool_slot(vk, b_s, b_sz);   pool_slot_dev(vk, out_s, out_sz);
+    rec_conv1d(vk, in_s, w_s, b_s, out_s, in_ch, n, out_ch, k, stride,
+               pad, dil, n_out, is_convt, epi);
+}
+
+void wubu_vk_train_act(WuBuVk *vk, int x_s, int o_s, int mode,
+                       int n_ch, int n, float sc) {
+    pool_slot_dev(vk, x_s, (size_t)n_ch * n * 4);
+    if (o_s >= 0) pool_slot_dev(vk, o_s, (size_t)n_ch * 4);
+    rec_act(vk, x_s, o_s, mode, n_ch, n, sc);
+}
+
+void wubu_vk_train_elt(WuBuVk *vk, int a_s, size_t a_off, int b_s, size_t b_off,
+                       int mode, size_t n) {
+    pool_slot_dev(vk, a_s, (a_off + n) * 4);
+    pool_slot_dev(vk, b_s, (b_off + n) * 4);
+    rec_elt(vk, a_s, a_off, b_s, b_off, mode, n);
+}
+
+void wubu_vk_train_bwd_conv1d(WuBuVk *vk, int in_s, int w_s, int dout_s,
+                              int din_s, int dw_s, int db_s,
+                              int in_ch, int out_ch, int k, int stride,
+                              int pad, int dil, int n_in, int n_out) {
+    pool_slot(vk, in_s, (size_t)in_ch * n_in * 4);
+    pool_slot(vk, w_s, (size_t)out_ch * in_ch * k * 4);
+    pool_slot_dev(vk, dout_s, (size_t)out_ch * n_out * 4);
+    pool_slot_dev(vk, din_s, (size_t)in_ch * n_in * 4);
+    /* grads are GPU-accumulated then staged-downloaded — keep them
+     * DEVICE_LOCAL-only so the PCIe BAR isn't exhausted (weights already
+     * consume ~112MB host-visible) */
+    pool_slot_dev(vk, dw_s, (size_t)out_ch * in_ch * k * 4);
+    pool_slot_dev(vk, db_s, (size_t)out_ch * 4);
+    rec_bwd_conv1d(vk, in_s, w_s, dout_s, din_s, dw_s, db_s,
+                   in_ch, out_ch, k, stride, pad, dil, n_in, n_out);
+}
+
+void wubu_vk_train_bwd_convt1d(WuBuVk *vk, int in_s, int w_s, int dout_s,
+                               int din_s, int dw_s, int db_s,
+                               int in_ch, int out_ch, int k, int stride,
+                               int pad, int n_in, int n_out) {
+    pool_slot(vk, in_s, (size_t)in_ch * n_in * 4);
+    pool_slot(vk, w_s, (size_t)in_ch * out_ch * k * 4);
+    pool_slot_dev(vk, dout_s, (size_t)out_ch * n_out * 4);
+    pool_slot_dev(vk, din_s, (size_t)in_ch * n_in * 4);
+    pool_slot_dev(vk, dw_s, (size_t)in_ch * out_ch * k * 4);
+    pool_slot_dev(vk, db_s, (size_t)out_ch * 4);
+    rec_bwd_convt1d(vk, in_s, w_s, dout_s, din_s, dw_s, db_s,
+                    in_ch, out_ch, k, stride, pad, n_in, n_out);
+}
+
+void wubu_vk_train_bwd_act(WuBuVk *vk, int x_s, int dout_s, int din_s,
+                           int mode, size_t n) {
+    pool_slot(vk, x_s, n * 4);
+    pool_slot_dev(vk, dout_s, n * 4);
+    pool_slot_dev(vk, din_s, n * 4);
+    rec_bwd_act(vk, x_s, dout_s, din_s, mode, n);
 }
 
 /* ── the full GeneratorNSF (mirrors wubu_generator_nsf_cuda) ── */

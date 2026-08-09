@@ -104,6 +104,9 @@ typedef struct TrainCacheVk TrainCacheVk;
 int  wubu_train_forward_vk(WuBuVk *vk, WuBuRVCModel *model, const float *mel_in,
                            int n_frames, float *audio, int max_samples,
                            TrainCacheVk *cache);
+/* The record-mode forward maps weights/grads via the training registry.
+ * Set it on the cache before calling forward (the step does this). */
+void wubu_train_cache_set_reg_vk(TrainCacheVk *cache, const WuBuTrainRegistry *reg);
 TrainCacheVk *wubu_train_cache_alloc_vk(void);
 void wubu_train_cache_free_vk(TrainCacheVk *cache);
 int  wubu_train_backward_vk(WuBuVk *vk, WuBuRVCModel *model, TrainCacheVk *cache,

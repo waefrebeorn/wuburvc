@@ -1,20 +1,25 @@
-/* wubu_train_vk.c — Vulkan-accelerated RVC training step.
+/* wubu_train_vk.c — Vulkan-accelerated RVC training step (RECORD MODE).
  *
  * Mirrors the CPU training math in wubu_train.c EXACTLY (Triple-DA: the CPU
  * train_step is the reference, the CUDA backend in wubu_train_cuda.cu is the
- * cross-checked twin). Provides:
+ * cross-checked twin). The VK backend records EVERY dispatch into one command
+ * buffer per step: weights + mel + intermediates live in GPU slots (200+),
+ * submitted once, grads downloaded once. Same math/shader kernels as the
+ * per-op path, but ~100x less PCIe round-trips (per-op measured ~2 min/step
+ * at F=96; record mode targets ~1-2 s/step).
  *
- *   1. wubu_train_forward_vk  — cached decoder forward (conv_pre → lrelu →
- *      upsample convT+MRF ×4 → conv_post → tanh). NO cond/sine/noise (the
- *      training reference is decoder_forward, not the inference generator).
- *   2. wubu_train_backward_vk — conv1d_bwd / convT1d_bwd / lrelu_bwd /
- *      tanh_bwd via the Vulkan backward pipelines, writing grads into the
- *      training registry (identical layout/keys to the CPU+CUDA paths).
- *   3. wubu_train_step_vk     — forward → MSE → backward → AdamW.
- *
- * All VK ops are the synchronous host-buffer public API (wubu_vk_conv1d /
- * wubu_vk_convt1d / wubu_vk_act / wubu_vk_elt / wubu_vk_bwd_*). The cache is
- * host-side float arrays (the VK module uploads/downloads per op).
+ * Slot map (wubu_train_vk.c owns these; WUBU_VK_TRAIN_BASE=200):
+ *   W(i)          weights — registry param i (uploaded once per step)
+ *   M             mel input (192 x F)
+ *   A(n)          act_in[n]
+ *   PRE           pre_out (conv_pre out, pre-lrelu)
+ *   U(n)          ups_out[n]
+ *   S(n)          stage_out[n]
+ *   MRF(L,s,cp,c) MRF caches: c = 0 p, 1 a1, 2 c1o, 3 a2, 4 c2o
+ *   POST          conv_post input
+ *   AUD           audio out (final tanh)
+ *   SCR(n)        backward scratch (d_audio, d_* working grads)
+ *   G(i)          grad slots — registry param i (zeroed, accumulated, DL'd)
  *
  * License: WaefreBeorn-UMV3
  */
@@ -32,9 +37,7 @@
 #include "wubu_vk.h"
 
 /* manual key builder (no snprintf — avoids MSVC CRT deps when linking the
- * nvcc object with MinGW). Builds e.g. "dec.ups.3.bias". The inference file
- * (wubu_rvc_cuda.cu) already defines kfmt; when compiled INTO that same
- * object (build/cuda_build.bat) the training copy must not collide. */
+ * nvcc object with MinGW). */
 static void tfmt(char *o, const char *pre, int a,
                  const char *mid, int b, const char *suf) {
     char *p = o;
@@ -53,70 +56,103 @@ static void tfmt(char *o, const char *pre, int a,
     *p = 0;
 }
 
+#define TB WUBU_VK_TRAIN_BASE
+#define SL_W(i)    (TB + (i))                    /* weights + grads, registry order */
+#define SL_G(i)    (TB + 160 + (i))
+#define SL_MEL     (TB + 330)
+#define SL_ACT(n)  (TB + 340 + (n))
+#define SL_PRE     (TB + 350)
+#define SL_UPS(n)  (TB + 360 + (n))
+#define SL_STG(n)  (TB + 370 + (n))
+#define SL_MRF(L,s,cp,c) (TB + 390 + (((L)*3 + (s))*3 + (cp))*5 + (c))
+#define SL_POST    (TB + 570)
+#define SL_AUD     (TB + 580)
+#define SL_SCR(n)  (TB + 590 + (n))              /* backward scratch */
+#define SL_BIAS0   (TB + 320)                    /* shared zero bias slot (zeroed in begin) */
+#define SL_STAGE   (TB + 590 + 49)              /* host-visible staging for grad downloads */
+#define SL_DBG0    (TB + 590 + 46)              /* host-visible debug dump slot */
+#define SL_DBG1    (TB + 590 + 47)              /* host-visible debug dump slot */
+
+/* weight slot cache: registry idx -> slot (weights are registry order) */
+static int w_slot(int reg_idx) { return SL_W(reg_idx); }
+static int g_slot(int reg_idx) { return SL_G(reg_idx); }
+/* bias slot: the tensor's own slot if present, else the shared zero slot */
+static int b_slot(int reg_idx) { return reg_idx >= 0 ? SL_W(reg_idx) : SL_BIAS0; }
+
 struct TrainCacheVk {
     int n_frames;
     int n_stage[4];
     int ch_in[4], ch_out[4];
     int k[4], s[4], p[4];
     int n_ups;
-    float *pre_out;      /* (init_ch, F) after conv_pre, PRE-lrelu */
-    float *act_in[5];    /* lrelu output per stage (act_in[0]=lrelu(pre_out)) */
-    float *stage_out[4]; /* MRF average output per stage (pre-lrelu into act) */
-    float *ups_out[4];   /* convT output per stage (pre-lrelu) — MRF input */
-    float *mrf_a1[4][3][3], *mrf_c1[4][3][3], *mrf_c1o[4][3][3];
-    float *mrf_a2[4][3][3], *mrf_c2o[4][3][3]; /* MRF intermediates for backward */
-    float *post_in;      /* lrelu(stage_out[3]) — conv_post input */
-    float *audio;        /* final tanh output (host) */
+    int n_out;                 /* audio sample count */
+    const WuBuTrainRegistry *reg;   /* registry for weight/grad slot mapping */
+    /* per-tensor registry indices (found once per forward) */
+    int ri_pre_w, ri_pre_b;
+    int ri_post_w, ri_post_b;
+    int ri_ups_w[4], ri_ups_b[4];
+    int ri_rb_w[4][3][3][2], ri_rb_b[4][3][3][2];
 };
 
 typedef struct TrainCacheVk TrainCacheVk;
 
-/* ── forward kernels via the public VK ops ─────────────────────────── */
+/* registry index helper — replaced by direct find_reg calls */
 
-static int vk_conv1d_fwd(WuBuVk *vk,
-                         const float *in, int in_ch, int n,
-                         const float *w, const float *b,
-                         int out_ch, int k, int stride, int pad, int dil,
-                         float *out, int n_out) {
-    return wubu_vk_conv1d(vk, in, in_ch, n, w, b, out_ch, k, stride, pad, dil,
-                          out, n_out);
+/* find registry idx by name in a provided registry; -1 if absent */
+static int find_reg(const WuBuTrainRegistry *reg, const char *name) {
+    return wubu_train_registry_find(reg, name);
 }
 
-static int vk_convt1d_fwd(WuBuVk *vk,
-                          const float *in, int in_ch, int n,
-                          const float *w, const float *b,
-                          int out_ch, int k, int stride, int pad,
-                          float *out, int n_out) {
-    return wubu_vk_convt1d(vk, in, in_ch, n, w, b, out_ch, k, stride, pad,
-                           out, n_out);
+/* upload a tensor's weights + zero its grad slot */
+static int upload_w(WuBuVk *vk, const WuBuTrainRegistry *reg, int ri,
+                    const float *data, size_t n) {
+    (void)reg;
+    if (ri < 0) return 0;         /* absent tensor (e.g. missing bias) */
+    if (!data) {                  /* zero-fill the weight slot + grad slot */
+        if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG uw zero ri=%d wslot=%d gslot=%d\n", ri, w_slot(ri), g_slot(ri));
+        if (wubu_vk_train_zero(vk, w_slot(ri), n * 4)) return -1;
+        if (wubu_vk_train_zero(vk, g_slot(ri), n * 4)) return -1;
+        return 0;
+    }
+    /* weight slot holds the CURRENT weights (re-uploaded every step — the
+     * model tensors are updated by AdamW on the host between steps). */
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG uw data ri=%d wslot=%d n=%zu\n", ri, w_slot(ri), n);
+    {
+        int rc_up = wubu_vk_train_upload(vk, w_slot(ri), data, n * 4);
+        if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG uw upload rc=%d\n", rc_up);
+        if (rc_up) return -1;
+    }
+    /* grad slot is zeroed at the START of the BACKWARD (backward zeroes every
+     * grad slot it accumulates into before the first bwd op). NOT here — the
+     * forward allocating 155 host-visible grad slots exhausts the PCIe BAR
+     * before the backward even starts. */
+    return 0;
 }
 
-static void vk_lrelu(WuBuVk *vk, float *x, int n_ch, int n) {
-    wubu_vk_act(vk, x, NULL, 0, n_ch, n, 0.0f);
-}
+/* ── forward (record mode) ────────────────────────────────────────── */
 
-static void vk_tanh(WuBuVk *vk, float *x, int n_ch, int n) {
-    wubu_vk_act(vk, x, NULL, 2, n_ch, n, 0.0f);
-}
-
-/* ── MRF forward helper (one stage): 3 stacks x 3 pairs, avg → stage_out ──
- * Pair math (EXACT match to wubu_train.c mrf_pair_fwd):
- *   a1 = lrelu(p); c1o = conv1(a1); a2 = lrelu(c1o); c2o = conv2(a2) + p
- * Intermediates cached for backward. */
-static int mrf_stage_fwd_vk(WuBuVk *vk, WuBuRVCModel *model, int L,
-                            const float *stack_in, float *stage_out,
-                            TrainCacheVk *cache, int ch, int n) {
+/* MRF stage forward recorded into GPU slots. cache arrays in slots. */
+static int mrf_stage_fwd_rec(WuBuVk *vk, WuBuRVCModel *model,
+                             const WuBuTrainRegistry *reg, int L,
+                             int in_slot, int stage_slot, TrainCacheVk *cache,
+                             int ch, int n) {
     const int dils[3] = { 1, 3, 5 };
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG mrf L=%d ch=%d n=%d\n", L, ch, n);
     for (int s = 0; s < 3; s++) {
         int rb = L * 3 + s;
-        const float *cur = stack_in;
+        int cur_s = in_slot;   /* EVERY stack starts fresh from the stage input */
+        if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG mrf L=%d s=%d\n", L, s);
         for (int cp = 0; cp < 3; cp++) {
             char key[128];
             tfmt(key, "dec.resblocks.", rb, ".convs1.", cp, ".weight_v");
             const RVCTensor *c1w = wubu_rvc_find_tensor(model, key);
             tfmt(key, "dec.resblocks.", rb, ".convs2.", cp, ".weight_v");
             const RVCTensor *c2w = wubu_rvc_find_tensor(model, key);
-            if (!c1w || !c1w->data || !c2w || !c2w->data) return -1;
+            if (!c1w || !c1w->data || !c2w || !c2w->data) {
+                if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG mrf L=%d s=%d cp=%d key='%s' c1w=%p c2w=%p\n",
+                        L, s, cp, key, (void*)c1w, (void*)c2w);
+                return -1;
+            }
             int k = c1w->dims[2];
             int dil = dils[cp];
             int pad1 = dil * (k - 1) / 2;
@@ -125,55 +161,61 @@ static int mrf_stage_fwd_vk(WuBuVk *vk, WuBuRVCModel *model, int L,
             const RVCTensor *c1b = wubu_rvc_find_tensor(model, key);
             tfmt(key, "dec.resblocks.", rb, ".convs2.", cp, ".bias");
             const RVCTensor *c2b = wubu_rvc_find_tensor(model, key);
-            /* allocate MRF intermediates (ch*n each) on first use */
-            if (!cache->mrf_c1[L][s][cp]) {
-                cache->mrf_c1[L][s][cp] = (float *)malloc((size_t)ch * n * sizeof(float));
-                cache->mrf_a1[L][s][cp] = (float *)malloc((size_t)ch * n * sizeof(float));
-                cache->mrf_c1o[L][s][cp] = (float *)malloc((size_t)ch * n * sizeof(float));
-                cache->mrf_a2[L][s][cp] = (float *)malloc((size_t)ch * n * sizeof(float));
-                cache->mrf_c2o[L][s][cp] = (float *)malloc((size_t)ch * n * sizeof(float));
-                if (!cache->mrf_c1[L][s][cp] || !cache->mrf_a1[L][s][cp] ||
-                    !cache->mrf_c1o[L][s][cp] || !cache->mrf_a2[L][s][cp] ||
-                    !cache->mrf_c2o[L][s][cp]) return -1;
-            }
-            /* mrf_c1 = p (pair input, PRE-lrelu — for backward lrelu_bwd) */
-            memcpy(cache->mrf_c1[L][s][cp], cur, (size_t)ch * n * sizeof(float));
+            int ri1w = cache->ri_rb_w[L][s][cp][0];
+            int ri1b = cache->ri_rb_b[L][s][cp][0];
+            int ri2w = cache->ri_rb_w[L][s][cp][1];
+            int ri2b = cache->ri_rb_b[L][s][cp][1];
+            if (getenv("WUBU_VK_DBG"))
+                fprintf(stderr, "VKDBG mrf L=%d s=%d cp=%d ri1w=%d ri1b=%d ri2w=%d ri2b=%d\n",
+                        L, s, cp, ri1w, ri1b, ri2w, ri2b);
+            if (upload_w(vk, reg, ri1w, c1w->data, (size_t)ch * ch * k) ||
+                upload_w(vk, reg, ri1b, (c1b && c1b->data) ? c1b->data : NULL, (size_t)ch) ||
+                upload_w(vk, reg, ri2w, c2w->data, (size_t)ch * ch * k) ||
+                upload_w(vk, reg, ri2b, (c2b && c2b->data) ? c2b->data : NULL, (size_t)ch))
+                return -1;
+            if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG mrf L=%d s=%d cp=%d uploads ok\n", L, s, cp);
+            int w1_s = w_slot(ri1w), b1_s = b_slot(ri1b);
+            int w2_s = w_slot(ri2w), b2_s = b_slot(ri2b);
+            int p_s = SL_MRF(L, s, cp, 0);   /* p = pair input (PRE-lrelu) */
+            int a1_s = SL_MRF(L, s, cp, 1);
+            int c1o_s = SL_MRF(L, s, cp, 2);
+            int a2_s = SL_MRF(L, s, cp, 3);
+            int c2o_s = SL_MRF(L, s, cp, 4);
+            /* p = cur (copy) */
+            wubu_vk_train_elt(vk, p_s, 0, cur_s, 0, 1, (size_t)ch * n);
             /* a1 = lrelu(p) */
-            memcpy(cache->mrf_a1[L][s][cp], cur, (size_t)ch * n * sizeof(float));
-            vk_lrelu(vk, cache->mrf_a1[L][s][cp], ch, n);
+            wubu_vk_train_elt(vk, a1_s, 0, p_s, 0, 1, (size_t)ch * n);
+            wubu_vk_train_act(vk, a1_s, -1, 0, ch, n, 0.0f);
             /* c1o = conv1(a1) */
-            vk_conv1d_fwd(vk, cache->mrf_a1[L][s][cp], ch, n, c1w->data,
-                          (c1b && c1b->data) ? c1b->data : NULL,
-                          ch, k, 1, pad1, dil, cache->mrf_c1o[L][s][cp], n);
-            /* a2 = lrelu(c1o) */
-            memcpy(cache->mrf_a2[L][s][cp], cache->mrf_c1o[L][s][cp], (size_t)ch * n * sizeof(float));
-            vk_lrelu(vk, cache->mrf_a2[L][s][cp], ch, n);
-            /* c2o = conv2(a2) + p (residual from ORIGINAL input) */
-            vk_conv1d_fwd(vk, cache->mrf_a2[L][s][cp], ch, n, c2w->data,
-                          (c2b && c2b->data) ? c2b->data : NULL,
-                          ch, k, 1, pad2, 1, cache->mrf_c2o[L][s][cp], n);
-            for (size_t i = 0; i < (size_t)ch * n; i++)
-                cache->mrf_c2o[L][s][cp][i] += cur[i];
-            cur = cache->mrf_c2o[L][s][cp];
+            wubu_vk_train_conv1d(vk, a1_s, w1_s, b1_s, c1o_s,
+                                 ch, n, ch, k, 1, pad1, dil, n, 0, 0);
+            /* a2 = lrelu(c1o); c2o = conv2(a2); then c2o += p */
+            wubu_vk_train_elt(vk, a2_s, 0, c1o_s, 0, 1, (size_t)ch * n);
+            wubu_vk_train_act(vk, a2_s, -1, 0, ch, n, 0.0f);
+            wubu_vk_train_conv1d(vk, a2_s, w2_s, b2_s, c2o_s,
+                                 ch, n, ch, k, 1, pad2, 1, n, 0, 0);
+            wubu_vk_train_elt(vk, c2o_s, 0, p_s, 0, 0, (size_t)ch * n); /* += p */
+            cur_s = c2o_s;
         }
-        /* accumulate this stack into stage_out (1/3 each) */
+        /* accumulate this stack: stage_out += cur */
         if (s == 0)
-            memcpy(stage_out, cur, (size_t)ch * n * sizeof(float));
+            wubu_vk_train_elt(vk, stage_slot, 0, cur_s, 0, 1, (size_t)ch * n);
         else
-            for (size_t i = 0; i < (size_t)ch * n; i++)
-                stage_out[i] += cur[i];
+            wubu_vk_train_elt(vk, stage_slot, 0, cur_s, 0, 0, (size_t)ch * n);
     }
-    for (size_t i = 0; i < (size_t)ch * n; i++)
-        stage_out[i] /= 3.0f;
+    /* scale by 1/3 */
+    wubu_vk_train_act(vk, stage_slot, -1, 4, ch, n, 1.0f / 3.0f);
     return 0;
 }
 
-/* ── cached forward ───────────────────────────────────────────────── */
 int wubu_train_forward_vk(WuBuVk *vk, WuBuRVCModel *model, const float *mel_in,
                           int n_frames, float *audio, int max_samples,
                           TrainCacheVk *cache) {
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG FWD-ENTER reg=%p\n", (void*)(cache ? cache->reg : NULL));
     if (!vk || !model || !mel_in || !audio || !cache) return -1;
+    const WuBuTrainRegistry *reg = cache->reg;
     memset(cache, 0, sizeof(*cache));
+    cache->reg = reg;
     cache->n_frames = n_frames;
 
     const RVCTensor *pre_w = wubu_rvc_find_tensor(model, "dec.conv_pre.weight");
@@ -189,18 +231,65 @@ int wubu_train_forward_vk(WuBuVk *vk, WuBuRVCModel *model, const float *mel_in,
     }
     int ch_in[4] = { init_ch, init_ch / 2, init_ch / 4, init_ch / 8 };
     int ch_out[4] = { init_ch / 2, init_ch / 4, init_ch / 8, init_ch / 16 };
+    /* NOTE: registry is passed via cache->reg (set by the step or test). */
 
-    /* conv_pre: mel_in col-major (pre_in, F) → (init_ch, F), PRE-lrelu in cache */
-    cache->pre_out = (float *)malloc((size_t)init_ch * n_frames * sizeof(float));
-    if (!cache->pre_out) return -1;
-    if (vk_conv1d_fwd(vk, mel_in, pre_in, n_frames, pre_w->data,
-                      (pre_b && pre_b->data) ? pre_b->data : NULL,
-                      init_ch, pk, 1, pk / 2, 1, cache->pre_out, n_frames) != 0)
-        return -1;
-    cache->act_in[0] = (float *)malloc((size_t)init_ch * n_frames * sizeof(float));
-    if (!cache->act_in[0]) return -1;
-    memcpy(cache->act_in[0], cache->pre_out, (size_t)init_ch * n_frames * sizeof(float));
-    vk_lrelu(vk, cache->act_in[0], init_ch, n_frames);
+    /* The forward needs the registry for weight slots — the step sets
+     * cache->reg before calling forward. Tests must set it too. */
+    if (!reg) { fprintf(stderr, "VKDBG fwd: no reg\n"); return -1; }
+
+    /* resolve registry indices (once) */
+    char key[128];
+    tfmt(key, "dec.conv_pre.weight", -1, "", -1, "");
+    cache->ri_pre_w = find_reg(reg, key);
+    tfmt(key, "dec.conv_pre.bias", -1, "", -1, "");
+    cache->ri_pre_b = find_reg(reg, key);
+    for (int L = 0; L < 4; L++) {
+        tfmt(key, "dec.ups.", L, "", -1, ".weight");
+        cache->ri_ups_w[L] = find_reg(reg, key);
+        tfmt(key, "dec.ups.", L, "", -1, ".bias");
+        cache->ri_ups_b[L] = find_reg(reg, key);
+        for (int s = 0; s < 3; s++)
+            for (int cp = 0; cp < 3; cp++) {
+                tfmt(key, "dec.resblocks.", L * 3 + s, ".convs1.", cp, ".weight_v");
+                cache->ri_rb_w[L][s][cp][0] = find_reg(reg, key);
+                tfmt(key, "dec.resblocks.", L * 3 + s, ".convs1.", cp, ".bias");
+                cache->ri_rb_b[L][s][cp][0] = find_reg(reg, key);
+                tfmt(key, "dec.resblocks.", L * 3 + s, ".convs2.", cp, ".weight_v");
+                cache->ri_rb_w[L][s][cp][1] = find_reg(reg, key);
+                tfmt(key, "dec.resblocks.", L * 3 + s, ".convs2.", cp, ".bias");
+                cache->ri_rb_b[L][s][cp][1] = find_reg(reg, key);
+            }
+    }
+    tfmt(key, "dec.conv_post.weight", -1, "", -1, "");
+    cache->ri_post_w = find_reg(reg, key);
+    tfmt(key, "dec.conv_post.bias", -1, "", -1, "");
+    cache->ri_post_b = find_reg(reg, key);
+
+    wubu_vk_train_begin(vk);
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG fwd: begin ok\n");
+    /* shared zero-bias slot (2048 floats — enough for any bias + debug dumps) */
+    if (wubu_vk_train_zero(vk, SL_BIAS0, 2048 * 4)) { wubu_vk_train_end(vk); return -1; }
+
+    /* conv_pre: mel -> pre_out (PRE-lrelu), then act_in[0] = lrelu */
+    if (cache->ri_pre_w < 0 || cache->ri_pre_b < 0) {
+        fprintf(stderr, "VKDBG fwd: pre reg missing ri_pre_w=%d ri_pre_b=%d\n",
+                cache->ri_pre_w, cache->ri_pre_b);
+    }
+    wubu_vk_train_upload(vk, SL_MEL, mel_in, (size_t)pre_in * n_frames * 4);
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG fwd: mel uploaded\n");
+    if (upload_w(vk, reg, cache->ri_pre_w, pre_w->data, (size_t)init_ch * pre_in * pk) ||
+        upload_w(vk, reg, cache->ri_pre_b, (pre_b && pre_b->data) ? pre_b->data : NULL, (size_t)init_ch))
+        { wubu_vk_train_end(vk); return -1; }
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG fwd: pre weights ok\n");
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG fwd: pre_w[0]=%.6f mel[0]=%.6f bias0=%d\n",
+            pre_w->data[0], mel_in[0], SL_BIAS0);
+    wubu_vk_train_conv1d(vk, SL_MEL, w_slot(cache->ri_pre_w), b_slot(cache->ri_pre_b), SL_PRE,
+                         pre_in, n_frames, init_ch, pk, 1, pk / 2, 1, n_frames, 0, 0);
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG fwd: conv_pre ok\n");
+    wubu_vk_train_elt(vk, SL_ACT(0), 0, SL_PRE, 0, 1, (size_t)init_ch * n_frames);
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG fwd: act0 copy ok\n");
+    wubu_vk_train_act(vk, SL_ACT(0), -1, 0, init_ch, n_frames, 0.0f);
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG fwd: act0 lrelu ok\n");
 
     /* upsample blocks */
     int cur_ch = init_ch, cur_n = n_frames;
@@ -210,96 +299,85 @@ int wubu_train_forward_vk(WuBuVk *vk, WuBuRVCModel *model, const float *mel_in,
         cache->ch_in[L] = cur_ch; cache->ch_out[L] = out_ch;
         cache->k[L] = kk[L]; cache->s[L] = rate[L]; cache->p[L] = (kk[L] - rate[L]) / 2;
         cache->n_stage[L] = out_n;
-        cache->ups_out[L] = (float *)malloc((size_t)out_ch * out_n * sizeof(float));
-        cache->stage_out[L] = (float *)malloc((size_t)out_ch * out_n * sizeof(float));
-        if (!cache->ups_out[L] || !cache->stage_out[L]) return -1;
-        char key[128];
         tfmt(key, "dec.ups.", L, "", -1, ".bias");
         const RVCTensor *ub = wubu_rvc_find_tensor(model, key);
-        if (vk_convt1d_fwd(vk, cache->act_in[L], cur_ch, cur_n,
-                           model->hifi_upsample_denorm[L],
-                           (ub && ub->data) ? ub->data : NULL,
-                           out_ch, kk[L], rate[L], (kk[L] - rate[L]) / 2,
-                           cache->ups_out[L], out_n) != 0)
+        if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG fwd: ups L=%d upload\n", L);
+        if (upload_w(vk, reg, cache->ri_ups_w[L], model->hifi_upsample_denorm[L],
+                     (size_t)cur_ch * out_ch * kk[L]) ||
+            upload_w(vk, reg, cache->ri_ups_b[L], (ub && ub->data) ? ub->data : NULL,
+                     (size_t)out_ch))
+            { wubu_vk_train_end(vk); return -1; }
+        if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG fwd: ups L=%d convt\n", L);
+        wubu_vk_train_conv1d(vk, SL_ACT(L), w_slot(cache->ri_ups_w[L]), b_slot(cache->ri_ups_b[L]), SL_UPS(L),
+                             cur_ch, cur_n, out_ch, kk[L], rate[L], (kk[L] - rate[L]) / 2,
+                             1, out_n, 1, 0);
+        if (mrf_stage_fwd_rec(vk, model, reg, L, SL_UPS(L), SL_STG(L), cache,
+                              out_ch, out_n) != 0) {
+            wubu_vk_train_end(vk);
             return -1;
-        if (mrf_stage_fwd_vk(vk, model, L, cache->ups_out[L], cache->stage_out[L],
-                             cache, out_ch, out_n) != 0)
-            return -1;
+        }
         if (L < n_ups - 1) {
-            cache->act_in[L + 1] = (float *)malloc((size_t)out_ch * out_n * sizeof(float));
-            if (!cache->act_in[L + 1]) return -1;
-            memcpy(cache->act_in[L + 1], cache->stage_out[L], (size_t)out_ch * out_n * sizeof(float));
-            vk_lrelu(vk, cache->act_in[L + 1], out_ch, out_n);
+            wubu_vk_train_elt(vk, SL_ACT(L + 1), 0, SL_STG(L), 0, 1, (size_t)out_ch * out_n);
+            wubu_vk_train_act(vk, SL_ACT(L + 1), -1, 0, out_ch, out_n, 0.0f);
         }
         cur_ch = out_ch; cur_n = out_n;
     }
 
     /* final: lrelu, conv_post, tanh */
     int n3 = cache->n_stage[3];
-    cache->post_in = (float *)malloc((size_t)32 * n3 * sizeof(float));
-    if (!cache->post_in) return -1;
-    memcpy(cache->post_in, cache->stage_out[3], (size_t)32 * n3 * sizeof(float));
-    vk_lrelu(vk, cache->post_in, 32, n3);
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG fwd: final lrelu n3=%d\n", n3);
+    wubu_vk_train_elt(vk, SL_POST, 0, SL_STG(3), 0, 1, (size_t)32 * n3);
+    wubu_vk_train_act(vk, SL_POST, -1, 0, 32, n3, 0.0f);
     const RVCTensor *post_w = wubu_rvc_find_tensor(model, "dec.conv_post.weight");
     const RVCTensor *post_b = wubu_rvc_find_tensor(model, "dec.conv_post.bias");
-    if (!post_w || !post_w->data) return -1;
+    if (!post_w || !post_w->data) { wubu_vk_train_end(vk); return -1; }
     int post_in = post_w->dims[1], post_k = post_w->dims[2];
     int out_n = n3 > max_samples ? max_samples : n3;
-    float *d_out = (float *)malloc((size_t)out_n * sizeof(float));
-    if (!d_out) return -1;
-    if (vk_conv1d_fwd(vk, cache->post_in, post_in, n3, post_w->data,
-                      (post_b && post_b->data) ? post_b->data : NULL,
-                      1, post_k, 1, post_k / 2, 1, d_out, out_n) != 0) {
-        free(d_out); return -1;
-    }
-    vk_tanh(vk, d_out, 1, out_n);
-    memcpy(audio, d_out, (size_t)out_n * sizeof(float));
-    cache->audio = (float *)malloc((size_t)out_n * sizeof(float));
-    if (cache->audio) memcpy(cache->audio, d_out, (size_t)out_n * sizeof(float));
-    free(d_out);
+    if (upload_w(vk, reg, cache->ri_post_w, post_w->data, (size_t)post_in * post_k) ||
+        upload_w(vk, reg, cache->ri_post_b, (post_b && post_b->data) ? post_b->data : NULL, 1))
+        { wubu_vk_train_end(vk); return -1; }
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG fwd: post weights ok ri_post_w=%d ri_post_b=%d\n", cache->ri_post_w, cache->ri_post_b);
+    /* SL_AUD is downloaded at the end — force host-visible BEFORE the conv
+     * would allocate it as DEVICE_LOCAL-only (pool_slot_dev keeps existing). */
+    if (wubu_vk_train_zero(vk, SL_AUD, (size_t)out_n * 4)) { wubu_vk_train_end(vk); return -1; }
+    wubu_vk_train_conv1d(vk, SL_POST, w_slot(cache->ri_post_w), b_slot(cache->ri_post_b), SL_AUD,
+                         post_in, n3, 1, post_k, 1, post_k / 2, 1, out_n, 0, 2); /* tanh epi */
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG fwd: post conv ok\n");
+    if (wubu_vk_train_end(vk) != 0) return -1;
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG fwd: end ok\n");
+    wubu_vk_train_download(vk, SL_AUD, audio, (size_t)out_n * 4);
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG fwd: aud dl ok\n");
+    cache->n_out = out_n;
     return out_n;
 }
 
 void wubu_train_cache_free_vk(TrainCacheVk *cache) {
-    if (!cache) return;
-    if (cache->pre_out) free(cache->pre_out);
-    for (int L = 0; L < 5; L++) if (cache->act_in[L]) free(cache->act_in[L]);
-    for (int L = 0; L < 4; L++) {
-        if (cache->stage_out[L]) free(cache->stage_out[L]);
-        if (cache->ups_out[L]) free(cache->ups_out[L]);
-        for (int s = 0; s < 3; s++)
-            for (int cp = 0; cp < 3; cp++) {
-                if (cache->mrf_a1[L][s][cp]) free(cache->mrf_a1[L][s][cp]);
-                if (cache->mrf_c1[L][s][cp]) free(cache->mrf_c1[L][s][cp]);
-                if (cache->mrf_c1o[L][s][cp]) free(cache->mrf_c1o[L][s][cp]);
-                if (cache->mrf_a2[L][s][cp]) free(cache->mrf_a2[L][s][cp]);
-                if (cache->mrf_c2o[L][s][cp]) free(cache->mrf_c2o[L][s][cp]);
-            }
-    }
-    if (cache->post_in) free(cache->post_in);
-    if (cache->audio) free(cache->audio);
+    (void)cache;   /* slots are VK-owned; no host allocations */
+}
+
+void wubu_train_cache_set_reg_vk(TrainCacheVk *cache, const WuBuTrainRegistry *reg) {
+    if (cache) cache->reg = reg;
 }
 
 TrainCacheVk *wubu_train_cache_alloc_vk(void) {
-    TrainCacheVk *c = (TrainCacheVk *)calloc(1, sizeof(TrainCacheVk));
-    return c;
+    return (TrainCacheVk *)calloc(1, sizeof(TrainCacheVk));
 }
 
-/* ── backward ─────────────────────────────────────────────────────── */
+/* ── backward (record mode) ───────────────────────────────────────── */
 
-/* one MRF pair backward: mirror of CPU mrf_pair_bwd + CUDA path.
- * Pair forward: a1=lrelu(p); c1o=conv1(a1); a2=lrelu(c1o); c2o=conv2(a2)+p
- * Backward: d_c2o → conv2_bwd(a2) → lrelu_bwd(c1o) → conv1_bwd(a1) →
- *           lrelu_bwd(p) + d_res (residual adds d_out back to p input).
- * d_in = grad wrt pair output; on return d_in = grad wrt pair input. */
-static void mrf_pair_bwd_vk(WuBuVk *vk, WuBuRVCModel *model,
-                            TrainCacheVk *cache, int L, int s, int cp,
-                            float *d_in, int ch, int n,
-                            WuBuTrainRegistry *reg) {
+/* GPU-side zero: record a vkCmdFillBuffer on the slot — works for
+ * DEVICE_LOCAL-only slots that host memset cannot touch and doesn't depend
+ * on a pre-zeroed source buffer. */
+static void gzero(WuBuVk *vk, int dst, size_t n) {
+    wubu_vk_train_fill_zero(vk, dst, n);
+}
+
+/* one MRF pair backward — recorded into slots. */
+static void mrf_pair_bwd_rec(WuBuVk *vk, WuBuRVCModel *model, TrainCacheVk *cache,
+                             int L, int s, int cp, int d_in_s, int ch, int n) {
     const int dils[3] = { 1, 3, 5 };
     int rb = L * 3 + s;
     int dil = dils[cp];
-    if (getenv("WUBU_VK_TRAIN_DBG")) { fprintf(stderr, "[vkt] pair L=%d s=%d cp=%d\n", L, s, cp); fflush(stderr); }
     char key[128];
     tfmt(key, "dec.resblocks.", rb, ".convs1.", cp, ".weight_v");
     const RVCTensor *c1w = wubu_rvc_find_tensor(model, key);
@@ -310,75 +388,64 @@ static void mrf_pair_bwd_vk(WuBuVk *vk, WuBuRVCModel *model,
     int pad1 = dil * (k - 1) / 2;
     int pad2 = k / 2;
 
-    float *d_res = (float *)malloc((size_t)ch * n * sizeof(float));
-    float *d_a2 = (float *)malloc((size_t)ch * n * sizeof(float));
-    float *d_c1o = (float *)malloc((size_t)ch * n * sizeof(float));
-    float *d_a1 = (float *)malloc((size_t)ch * n * sizeof(float));
-    float *d_p = (float *)malloc((size_t)ch * n * sizeof(float));
-    if (!d_res || !d_a2 || !d_c1o || !d_a1 || !d_p) { free(d_res); free(d_a2); free(d_c1o); free(d_a1); free(d_p); return; }
-    memcpy(d_res, d_in, (size_t)ch * n * sizeof(float));   /* residual path */
-    if (getenv("WUBU_VK_TRAIN_DBG")) { fprintf(stderr, "[vkt] pair alloc ok\n"); fflush(stderr); }
+    int p_s = SL_MRF(L, s, cp, 0);
+    int a1_s = SL_MRF(L, s, cp, 1);
+    int c1o_s = SL_MRF(L, s, cp, 2);
+    int a2_s = SL_MRF(L, s, cp, 3);
+    int c2o_s = SL_MRF(L, s, cp, 4);
+    int w1_s = w_slot(cache->ri_rb_w[L][s][cp][0]);
+    int b1_s = b_slot(cache->ri_rb_b[L][s][cp][0]);
+    int w2_s = w_slot(cache->ri_rb_w[L][s][cp][1]);
+    int b2_s = b_slot(cache->ri_rb_b[L][s][cp][1]);
+    int dw1 = g_slot(cache->ri_rb_w[L][s][cp][0]);
+    int db1 = g_slot(cache->ri_rb_b[L][s][cp][0]);
+    int dw2 = g_slot(cache->ri_rb_w[L][s][cp][1]);
+    int db2 = g_slot(cache->ri_rb_b[L][s][cp][1]);
 
-    tfmt(key, "dec.resblocks.", rb, ".convs2.", cp, ".weight_v");
-    int i2w = wubu_train_registry_find(reg, key);
-    float *dw2 = (i2w >= 0) ? reg->params[i2w].grad : NULL;
-    tfmt(key, "dec.resblocks.", rb, ".convs2.", cp, ".bias");
-    int i2b = wubu_train_registry_find(reg, key);
-    float *db2 = (i2b >= 0) ? reg->params[i2b].grad : NULL;
-    /* conv2 bwd: in=a2, w=c2w, dout=d_in → d_a2, dw2, db2 */
-    float *w2tmp = (float *)malloc((size_t)ch * ch * k * sizeof(float));
-    if (!w2tmp) { free(d_res); free(d_a2); free(d_c1o); free(d_a1); free(d_p); return; }
-    memcpy(w2tmp, c2w->data, (size_t)ch * ch * k * sizeof(float));
-    memset(d_a2, 0, (size_t)ch * n * sizeof(float));
-    if (getenv("WUBU_VK_TRAIN_DBG")) { fprintf(stderr, "[vkt] pair conv2 bwd ch=%d n=%d\n", ch, n); fflush(stderr); }
-    wubu_vk_bwd_conv1d(vk, cache->mrf_a2[L][s][cp], ch, w2tmp, d_in,
-                       ch, k, 1, pad2, 1, n, n, d_a2, dw2, db2);
-    if (getenv("WUBU_VK_TRAIN_DBG")) { fprintf(stderr, "[vkt] pair conv2 bwd done\n"); fflush(stderr); }
-    free(w2tmp);
-
-    /* lrelu_bwd after conv1: pre-act = c1o */
-    wubu_vk_bwd_act(vk, cache->mrf_c1o[L][s][cp], d_a2, d_c1o, 0, (size_t)ch * n);
-
-    /* conv1 bwd: in=a1, w=c1w, dout=d_c1o → d_a1, dw1, db1 */
-    tfmt(key, "dec.resblocks.", rb, ".convs1.", cp, ".weight_v");
-    int i1w = wubu_train_registry_find(reg, key);
-    float *dw1 = (i1w >= 0) ? reg->params[i1w].grad : NULL;
-    tfmt(key, "dec.resblocks.", rb, ".convs1.", cp, ".bias");
-    int i1b = wubu_train_registry_find(reg, key);
-    float *db1 = (i1b >= 0) ? reg->params[i1b].grad : NULL;
-    float *w1tmp = (float *)malloc((size_t)ch * ch * k * sizeof(float));
-    if (!w1tmp) { free(d_res); free(d_a2); free(d_c1o); free(d_a1); free(d_p); return; }
-    memcpy(w1tmp, c1w->data, (size_t)ch * ch * k * sizeof(float));
-    memset(d_a1, 0, (size_t)ch * n * sizeof(float));
-    wubu_vk_bwd_conv1d(vk, cache->mrf_a1[L][s][cp], ch, w1tmp, d_c1o,
-                       ch, k, 1, pad1, dil, n, n, d_a1, dw1, db1);
-    free(w1tmp);
-
-    /* lrelu_bwd before conv1: pre-act = p (mrf_c1 slot); residual add */
-    wubu_vk_bwd_act(vk, cache->mrf_c1[L][s][cp], d_a1, d_p, 0, (size_t)ch * n);
-    for (size_t i = 0; i < (size_t)ch * n; i++)
-        d_in[i] = d_p[i] + d_res[i];
-
-    free(d_res); free(d_a2); free(d_c1o); free(d_a1); free(d_p);
+    /* d_res = d_in (residual path) */
+    int d_res = SL_SCR(10);
+    wubu_vk_train_elt(vk, d_res, 0, d_in_s, 0, 1, (size_t)ch * n);
+    /* conv2 bwd: in a2, w2, dout d_in -> d_a2, dw2, db2 */
+    int d_a2 = SL_SCR(11);
+    gzero(vk, d_a2, (size_t)ch * n);
+    gzero(vk, dw2, (size_t)ch * ch * k);   /* grad slots accumulate — zero first */
+    gzero(vk, db2, (size_t)ch);
+    wubu_vk_train_bwd_conv1d(vk, a2_s, w2_s, d_in_s, d_a2, dw2, db2,
+                             ch, ch, k, 1, pad2, 1, n, n);
+    /* lrelu_bwd: pre-act c1o */
+    int d_c1o = SL_SCR(12);
+    wubu_vk_train_bwd_act(vk, c1o_s, d_a2, d_c1o, 0, (size_t)ch * n);
+    /* conv1 bwd: in a1, w1, dout d_c1o -> d_a1, dw1, db1 */
+    int d_a1 = SL_SCR(13);
+    gzero(vk, d_a1, (size_t)ch * n);
+    gzero(vk, dw1, (size_t)ch * ch * k);   /* grad slots accumulate — zero first */
+    gzero(vk, db1, (size_t)ch);
+    wubu_vk_train_bwd_conv1d(vk, a1_s, w1_s, d_c1o, d_a1, dw1, db1,
+                             ch, ch, k, 1, pad1, dil, n, n);
+    /* lrelu_bwd: pre-act p */
+    int d_p = SL_SCR(14);
+    wubu_vk_train_bwd_act(vk, p_s, d_a1, d_p, 0, (size_t)ch * n);
+    /* d_in = d_p + d_res */
+    wubu_vk_train_elt(vk, d_in_s, 0, d_p, 0, 1, (size_t)ch * n);
+    wubu_vk_train_elt(vk, d_in_s, 0, d_res, 0, 0, (size_t)ch * n);
+    (void)c2o_s;
 }
 
-/* one MRF stage backward: d_stage_out (grad wrt stage_out) → d_stage_in
- * (grad wrt ups_out = MRF input) */
-static void mrf_stage_bwd_vk(WuBuVk *vk, WuBuRVCModel *model, int L,
-                             TrainCacheVk *cache, const float *d_stage_out,
-                             float *d_stage_in, int ch, int n,
-                             WuBuTrainRegistry *reg) {
-    for (size_t i = 0; i < (size_t)ch * n; i++) d_stage_in[i] = 0.0f;
+static void mrf_stage_bwd_rec(WuBuVk *vk, WuBuRVCModel *model, TrainCacheVk *cache,
+                              int L, int d_stage_in_s, int d_stage_out_s,
+                              int ch, int n) {
     for (int s = 0; s < 3; s++) {
-        float *d_in = (float *)malloc((size_t)ch * n * sizeof(float));
-        if (!d_in) return;
-        for (size_t i = 0; i < (size_t)ch * n; i++)
-            d_in[i] = d_stage_out[i] / 3.0f;
+        /* distinct d_in per stack — the pipelined ring can have stack s-1's
+         * final accumulate still in flight when stack s's first elt runs;
+         * sharing one scratch slot would race (read vs overwrite). */
+        int d_in = SL_SCR(20 + s);
+        /* d_in = d_stage_out / 3 */
+        wubu_vk_train_elt(vk, d_in, 0, d_stage_out_s, 0, 1, (size_t)ch * n);
+        wubu_vk_train_act(vk, d_in, -1, 4, ch, n, 1.0f / 3.0f);
         for (int cp = 2; cp >= 0; cp--)
-            mrf_pair_bwd_vk(vk, model, cache, L, s, cp, d_in, ch, n, reg);
-        for (size_t i = 0; i < (size_t)ch * n; i++)
-            d_stage_in[i] += d_in[i];
-        free(d_in);
+            mrf_pair_bwd_rec(vk, model, cache, L, s, cp, d_in, ch, n);
+        /* d_stage_in += d_in */
+        wubu_vk_train_elt(vk, d_stage_in_s, 0, d_in, 0, 0, (size_t)ch * n);
     }
 }
 
@@ -388,140 +455,162 @@ int wubu_train_backward_vk(WuBuVk *vk, WuBuRVCModel *model, TrainCacheVk *cache,
     if (!vk || !model || !cache || !d_audio || !reg) return -1;
     int n3 = cache->n_stage[3];
 
-    /* d_audio → tanh' → conv_post bwd → lrelu' (pre-act = stage_out[3]) */
-    float *d_tanh_in = (float *)malloc((size_t)n3 * sizeof(float));
-    float *d_post_out = (float *)malloc((size_t)32 * n3 * sizeof(float));
-    float *d_stage3 = (float *)malloc((size_t)32 * n3 * sizeof(float));
-    if (!d_tanh_in || !d_post_out || !d_stage3) { free(d_tanh_in); free(d_post_out); free(d_stage3); return -1; }
-    wubu_vk_bwd_act(vk, cache->audio, d_audio, d_tanh_in, 1, (size_t)n3);
-    if (getenv("WUBU_VK_TRAIN_DBG")) fprintf(stderr, "[vkt] d_tanh_in[0]=%.6f last=%.6f d_audio[0]=%.6f\n", d_tanh_in[0], d_tanh_in[n3 - 1], d_audio[0]);
+    /* NOTE: grad slots are DEVICE_LOCAL-only (bwd record ops allocate them
+     * that way to keep the PCIe BAR free for the weight uploads). All zeroing
+     * below is GPU-side (gzero elt copies from the persistent GPU zero slot);
+     * the final download stages each grad through the host-visible SL_STAGE. */
+    wubu_vk_train_begin(vk);
+
+    /* host-visible staging for grad downloads — SMALL (1MB) because the BAR
+     * is already consumed by the weight uploads; each grad is staged in
+     * 1MB chunks below. */
+    {
+        if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG bwd: stage alloc 1MB\n");
+        if (wubu_vk_train_zero(vk, SL_STAGE, 1024 * 1024)) {
+            if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG bwd: STAGE ALLOC FAIL\n");
+            wubu_vk_train_end(vk); return -1;
+        }
+        if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG bwd: stage ok\n");
+    }
+
+    /* d_audio -> tanh_bwd -> conv_post bwd -> lrelu_bwd -> MRF3 */
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG bwd: begin ok\n");
+    wubu_vk_train_upload(vk, SL_SCR(30), d_audio, (size_t)n3 * 4);
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG bwd: d_audio uploaded\n");
+    int d_tanh = SL_SCR(31);
+    wubu_vk_train_bwd_act(vk, SL_AUD, SL_SCR(30), d_tanh, 1, (size_t)n3);
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG bwd: tanh bwd done\n");
     const RVCTensor *post_w = wubu_rvc_find_tensor(model, "dec.conv_post.weight");
-    if (!post_w || !post_w->data) { free(d_tanh_in); free(d_post_out); free(d_stage3); return -1; }
+    if (!post_w || !post_w->data) { wubu_vk_train_end(vk); return -1; }
     int post_in = post_w->dims[1], post_k = post_w->dims[2];
-    int ipw = wubu_train_registry_find(reg, "dec.conv_post.weight");
-    float *dpw = (ipw >= 0) ? reg->params[ipw].grad : NULL;
-    int ipb = wubu_train_registry_find(reg, "dec.conv_post.bias");
-    float *dpb = (ipb >= 0) ? reg->params[ipb].grad : NULL;
-    float *db_dummy = (float *)calloc((size_t)post_in, sizeof(float));
-    if (!db_dummy) { free(d_tanh_in); free(d_post_out); free(d_stage3); return -1; }
-    float *dpb_use = dpb ? dpb : db_dummy;
-    if (getenv("WUBU_VK_TRAIN_DBG")) fprintf(stderr, "[vkt] conv_post ipw=%d ipb=%d dpw=%p dpb=%p\n", ipw, ipb, (void*)dpw, (void*)dpb);
-    float *wpt = (float *)malloc((size_t)post_in * post_k * sizeof(float));
-    if (!wpt) { free(db_dummy); free(d_tanh_in); free(d_post_out); free(d_stage3); return -1; }
-    memcpy(wpt, post_w->data, (size_t)post_in * post_k * sizeof(float));
-    memset(d_post_out, 0, (size_t)32 * n3 * sizeof(float));
-    wubu_vk_bwd_conv1d(vk, cache->post_in, post_in, wpt, d_tanh_in,
-                       1, post_k, 1, post_k / 2, 1, n3, n3,
-                       d_post_out, dpw, dpb_use);
-    free(wpt);
-    free(db_dummy);
-    wubu_vk_bwd_act(vk, cache->stage_out[3], d_post_out, d_stage3, 0, (size_t)32 * n3);
-    if (getenv("WUBU_VK_TRAIN_DBG")) fprintf(stderr, "[vkt] d_stage3[0]=%.6f last=%.6f d_post_out[0]=%.6f\n", d_stage3[0], d_stage3[(size_t)32 * n3 - 1], d_post_out[0]);
+    int d_post = SL_SCR(32);
+    gzero(vk, d_post, (size_t)32 * n3);
+    gzero(vk, g_slot(cache->ri_post_w), (size_t)post_in * post_k);
+    if (cache->ri_post_b >= 0) gzero(vk, g_slot(cache->ri_post_b), 1);
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG bwd: d_post zeroed\n");
+    {
+        int dbp = (cache->ri_post_b >= 0) ? g_slot(cache->ri_post_b) : SL_SCR(48);
+        wubu_vk_train_bwd_conv1d(vk, SL_POST, w_slot(cache->ri_post_w), d_tanh,
+                                 d_post, g_slot(cache->ri_post_w), dbp,
+                                 post_in, 1, post_k, 1, post_k / 2, 1, n3, n3);
+    }
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG bwd: conv_post bwd done\n");
+    /* conv_post uses post_in dims, not stage ch */
+    int d_stage3 = SL_SCR(35);
+    wubu_vk_train_bwd_act(vk, SL_STG(3), d_post, d_stage3, 0, (size_t)32 * n3);
 
-    /* MRF backward, stage 3 → 0 */
-    float *d_stage_in = NULL;
-    float *d_ups = (float *)malloc((size_t)32 * n3 * sizeof(float));
-    if (!d_ups) { free(d_tanh_in); free(d_post_out); free(d_stage3); return -1; }
-    d_stage_in = d_ups;
-    mrf_stage_bwd_vk(vk, model, 3, cache, d_stage3, d_stage_in, 32, n3, reg);
-    int cur_ch = 32, cur_n = n3;
-    float *d_act0 = NULL;   /* grad wrt act_in[0] — kept for conv_pre bwd */
-    int ups_freed = 0;      /* d_ups was handed to the loop as d_stage_in */
-
+    /* MRF backward stages 3 -> 0 */
+    int d_stage_in = SL_SCR(36);
+    gzero(vk, d_stage_in, (size_t)32 * n3);
+    mrf_stage_bwd_rec(vk, model, cache, 3, d_stage_in, d_stage3, 32, n3);
+    int d_act = SL_SCR(37);
     for (int L = 3; L >= 0; L--) {
-        /* upsample backward: din wrt act_in[L] */
         int in_ch = cache->ch_in[L];
         int out_ch = cache->ch_out[L];
         int in_n = (L == 0) ? cache->n_frames : cache->n_stage[L - 1];
         int kk = cache->k[L], stride = cache->s[L], pad = cache->p[L];
-        cur_n = cache->n_stage[L];   /* convT output length for stage L */
-        char key[128];
-        tfmt(key, "dec.ups.", L, "", -1, ".weight");
-        int iuw = wubu_train_registry_find(reg, key);
-        float *duw = (iuw >= 0) ? reg->params[iuw].grad : NULL;
-        tfmt(key, "dec.ups.", L, "", -1, ".bias");
-        int iub = wubu_train_registry_find(reg, key);
-        float *dub = (iub >= 0) ? reg->params[iub].grad : NULL;
-        float *d_act = (float *)calloc((size_t)in_ch * in_n, sizeof(float));
-        if (!d_act) { if (!ups_freed) free(d_ups); free(d_tanh_in); free(d_post_out); free(d_stage3); return -1; }
-        float *wt = (float *)malloc((size_t)in_ch * out_ch * kk * sizeof(float));
-        if (!wt) { free(d_act); if (!ups_freed) free(d_ups); free(d_tanh_in); free(d_post_out); free(d_stage3); return -1; }
-        memcpy(wt, model->hifi_upsample_denorm[L], (size_t)in_ch * out_ch * kk * sizeof(float));
-        wubu_vk_bwd_convt1d(vk, cache->act_in[L], in_ch, wt, d_stage_in,
-                            out_ch, kk, stride, pad, in_n, cur_n,
-                            d_act, duw, dub);
-        free(wt);
-
+        int d_act_s = d_act;
+        if (L >= 1) d_act_s = SL_SCR(37 + L);  /* distinct per stage */
+        gzero(vk, d_act_s, (size_t)in_ch * in_n);
+        gzero(vk, g_slot(cache->ri_ups_w[L]), (size_t)in_ch * out_ch * kk);
+        if (cache->ri_ups_b[L] >= 0) gzero(vk, g_slot(cache->ri_ups_b[L]), (size_t)out_ch);
+        {
+            int dub = (cache->ri_ups_b[L] >= 0) ? g_slot(cache->ri_ups_b[L]) : SL_SCR(48);
+            /* n_out for ups[L] convT bwd = n_stage[L] (CPU ref:
+             * convt1d_bwd(..., n_in=n_stage[L-1], n_out=n_stage[L])). The old
+             * cur_n bookkeeping drifted one stage high (L=2 used n_stage[3]…),
+             * which made the shader read dout past its real length AND made
+             * pool_slot_dev grow the d_stage_in slot mid-chain — silently
+             * discarding the MRF output (first-call L1chain all-zero bug). */
+            wubu_vk_train_bwd_convt1d(vk, SL_ACT(L), w_slot(cache->ri_ups_w[L]), d_stage_in,
+                                      d_act_s, g_slot(cache->ri_ups_w[L]), dub,
+                                      in_ch, out_ch, kk, stride, pad, in_n,
+                                      cache->n_stage[L]);
+        }
         if (L >= 1) {
-            /* d_act = grad wrt act_in[L] = lrelu(stage_out[L-1]), so it has
-             * in_ch × in_n dims (NOT the convT output dims). stage_out[L-1]
-             * shares those dims: ch_out[L-1]==ch_in[L], n_stage[L-1]==in_n. */
-            float *d_stage_prev = (float *)malloc((size_t)in_ch * in_n * sizeof(float));
-            if (!d_stage_prev) { free(d_act); if (!ups_freed) free(d_ups); free(d_tanh_in); free(d_post_out); free(d_stage3); return -1; }
-            wubu_vk_bwd_act(vk, cache->stage_out[L - 1], d_act, d_stage_prev, 0,
-                            (size_t)in_ch * in_n);
-            if (d_stage_in) { free(d_stage_in); if (d_stage_in == d_ups) ups_freed = 1; }
-            d_stage_in = d_stage_prev;
-            /* MRF bwd for stage L-1 — MRF runs on ch_out[L-1] channels
-             * (NOT ch_in: the MRF input is ups_out[L-1] which has ch_out
-             * channels; ch_in[L-1] is the *convT input* width). */
+            int d_stage_prev = SL_SCR(42 + L);
+            wubu_vk_train_bwd_act(vk, SL_STG(L - 1), d_act_s, d_stage_prev, 0,
+                                  (size_t)in_ch * in_n);
             int nch = cache->ch_out[L - 1];
-            float *d_next = (float *)malloc((size_t)nch * cache->n_stage[L - 1] * sizeof(float));
-            if (!d_next) { free(d_act); free(d_stage_in); if (!ups_freed) free(d_ups); free(d_tanh_in); free(d_post_out); free(d_stage3); return -1; }
-            mrf_stage_bwd_vk(vk, model, L - 1, cache, d_stage_in, d_next,
-                             nch, cache->n_stage[L - 1], reg);
-            free(d_stage_in);
-            d_stage_in = d_next;
+            gzero(vk, d_stage_in, (size_t)nch * cache->n_stage[L - 1]);
+            mrf_stage_bwd_rec(vk, model, cache, L - 1, d_stage_in, d_stage_prev,
+                              nch, cache->n_stage[L - 1]);
         } else {
-            /* L == 0: keep d_act (grad wrt act_in[0]) for conv_pre */
-            d_act0 = d_act;
-            d_act = NULL;
-        }
-        free(d_act);
-    }
-    /* d_stage_in = grad wrt ups_out[0] — consumed by convT0 above; free it */
-    if (d_stage_in) { free(d_stage_in); if (d_stage_in == d_ups) ups_freed = 1; d_stage_in = NULL; }
-    if (!ups_freed) free(d_ups);
-
-    /* conv_pre backward: lrelu' (pre_out) then conv1d_bwd(mel) */
-    {
-        int init_ch = cache->ch_in[0];
-        float *d_pre = (float *)malloc((size_t)init_ch * cache->n_frames * sizeof(float));
-        if (!d_pre) { free(d_act0); free(d_ups); free(d_tanh_in); free(d_post_out); free(d_stage3); return -1; }
-        const RVCTensor *pre_w = wubu_rvc_find_tensor(model, "dec.conv_pre.weight");
-        int pre_in = pre_w->dims[1], pk = pre_w->dims[2];
-        wubu_vk_bwd_act(vk, cache->pre_out, d_act0, d_pre, 0, (size_t)init_ch * cache->n_frames);
-        free(d_act0); d_act0 = NULL;
-
-        /* conv_pre weight grads */
-        char key[128];
-        tfmt(key, "dec.conv_pre.weight", -1, "", -1, "");
-        int ipw2 = wubu_train_registry_find(reg, key);
-        float *dpw2 = (ipw2 >= 0) ? reg->params[ipw2].grad : NULL;
-        tfmt(key, "dec.conv_pre.bias", -1, "", -1, "");
-        int ipb2 = wubu_train_registry_find(reg, key);
-        float *dpb2 = (ipb2 >= 0) ? reg->params[ipb2].grad : NULL;
-        float *wpt = (float *)malloc((size_t)init_ch * pre_in * pk * sizeof(float));
-        if (wpt) {
-            memcpy(wpt, pre_w->data, (size_t)init_ch * pre_in * pk * sizeof(float));
-            float *d_mel = (float *)calloc((size_t)pre_in * cache->n_frames, sizeof(float));
-            if (d_mel) {
-                /* d_pre holds the lrelu grad (from the bwd_act above) — the
-                 * bwd_conv1d zeroes its OWN din/dw/db slots; d_pre must NOT
-                 * be wiped here (that was a bug: conv_pre grads came out 0). */
-                wubu_vk_bwd_conv1d(vk, mel_in, pre_in, wpt, d_pre,
-                                   init_ch, pk, 1, pk / 2, 1,
-                                   cache->n_frames, cache->n_frames,
-                                   d_mel, dpw2, dpb2);
-                free(d_mel);
+            /* L == 0: d_act = grad wrt act_in[0] — conv_pre */
+            int init_ch = cache->ch_in[0];
+            int d_pre = SL_SCR(44);
+            if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG bwd: L=0 d_act_s=%d\n", d_act_s);
+            wubu_vk_train_bwd_act(vk, SL_PRE, d_act_s, d_pre, 0,
+                                  (size_t)init_ch * cache->n_frames);
+            if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG bwd: L=0 pre bwd_act done\n");
+            const RVCTensor *pre_w = wubu_rvc_find_tensor(model, "dec.conv_pre.weight");
+            if (!pre_w || !pre_w->data) { wubu_vk_train_end(vk); return -1; }
+            int pre_in = pre_w->dims[1], pk = pre_w->dims[2];
+            gzero(vk, g_slot(cache->ri_pre_w), (size_t)init_ch * pre_in * pk);
+            if (cache->ri_pre_b >= 0) gzero(vk, g_slot(cache->ri_pre_b), (size_t)init_ch);
+            {
+                int dbp = (cache->ri_pre_b >= 0) ? g_slot(cache->ri_pre_b) : SL_SCR(48);
+                wubu_vk_train_bwd_conv1d(vk, SL_MEL, w_slot(cache->ri_pre_w), d_pre,
+                                         SL_SCR(46), g_slot(cache->ri_pre_w), dbp,
+                                         pre_in, init_ch, pk, 1, pk / 2, 1,
+                                         cache->n_frames, cache->n_frames);
             }
-            free(wpt);
         }
-        free(d_pre);
+        if (L > 0) d_stage_in = SL_SCR(36); /* reuse */
     }
 
-    if (!ups_freed) free(d_ups);
-    free(d_tanh_in); free(d_post_out); free(d_stage3);
+    if (wubu_vk_train_end(vk) != 0) return -1;
+
+    if (getenv("WUBU_VK_DBG")) {
+        /* registry index consistency check */
+        for (int i = 0; i < reg->count && i < 160; i++) {
+            if (strcmp(reg->params[i].name, "dec.resblocks.3.convs1.0.weight_v") == 0)
+                fprintf(stderr, "VKDBG bwd: reg_vk idx of rb3c1w0 = %d\n", i);
+        }
+        /* dump the L=1 chain: d_stage_prev (833), d_act (828) + d_stage_in (826)
+         * L=1 dims: d_act 256x160, d_stage_prev 256x160; d_stage_in 128x1280 */
+        int slots[3] = { 833, 828, 826 };
+        size_t sizes[3] = { (size_t)256 * 160, (size_t)256 * 160, (size_t)128 * 1280 };
+        for (int si = 0; si < 3; si++) {
+            size_t chunk = 256 * 1024;   /* fit SL_STAGE 1MB */
+            float *tmp = malloc(sizes[si] * 4);
+            for (size_t off = 0; off < sizes[si]; off += chunk) {
+                size_t cnt = (sizes[si] - off < chunk) ? sizes[si] - off : chunk;
+                if (wubu_vk_train_begin(vk) != 0) return -1;
+                wubu_vk_train_elt(vk, SL_STAGE, 0, slots[si], off, 1, cnt);
+                wubu_vk_train_end(vk);
+                wubu_vk_train_download(vk, SL_STAGE, tmp + off, cnt * 4);
+            }
+            long z = 0, nz = 0; float vmin = 1e30f, vmax = -1e30f;
+            for (size_t j = 0; j < sizes[si]; j++) {
+                if (tmp[j] == 0.0f) z++; else nz++;
+                if (tmp[j] < vmin) vmin = tmp[j];
+                if (tmp[j] > vmax) vmax = tmp[j];
+            }
+            fprintf(stderr, "VKDBG bwd: L1chain slot%d zero=%ld nz=%ld vmin=%.6f vmax=%.6f\n",
+                    slots[si], z, nz, vmin, vmax);
+            free(tmp);
+        }
+    }
+
+    /* staged download: grads are DEVICE_LOCAL; copy each into the small
+     * host-visible staging slot in 256K-float chunks, then read it back. */
+    {
+        const int chunk = 256 * 1024;   /* 1MB floats*4 staging */
+        for (int i = 0; i < reg->count; i++) {
+            if (!reg->params[i].grad || reg->params[i].n <= 0) continue;
+            int n = reg->params[i].n;
+            for (int off = 0; off < n; off += chunk) {
+                int cnt = (n - off < chunk) ? n - off : chunk;
+                if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG dl i=%d off=%d cnt=%d\n", i, off, cnt);
+                if (wubu_vk_train_begin(vk) != 0) return -1;
+                wubu_vk_train_elt(vk, SL_STAGE, 0, g_slot(i), off, 1, (size_t)cnt);
+                if (wubu_vk_train_end(vk) != 0) return -1;
+                wubu_vk_train_download(vk, SL_STAGE,
+                                       reg->params[i].grad + off, (size_t)cnt * 4);
+            }
+        }
+    }
     return 0;
 }
 
@@ -536,9 +625,15 @@ int wubu_train_step_vk(WuBuVk *vk, WuBuRVCModel *model, WuBuTrainRegistry *reg,
     if (!audio) return -1;
     TrainCacheVk *cache = wubu_train_cache_alloc_vk();
     if (!cache) { free(audio); return -1; }
+    cache->reg = reg;
     int n_out = wubu_train_forward_vk(vk, model, mel_in, n_frames, audio, max_samples, cache);
     if (n_out <= 0) { free(audio); wubu_train_cache_free_vk(cache); free(cache); return -1; }
     int n = n_out < n_samples ? n_out : n_samples;
+    if (epoch == 0 && getenv("WUBU_VK_DBG")) {
+        float s = 0.0f;
+        for (int i = 0; i < n && i < 256; i++) s += audio[i] * audio[i];
+        fprintf(stderr, "VKDBG step0 audio rms0=%.6f (n=%d)\n", sqrtf(s / (n < 256 ? n : 256)), n);
+    }
     float mse = wubu_mse_loss(audio, wav, n);
     if (loss_out) *loss_out = mse;
     model->last_loss = mse;

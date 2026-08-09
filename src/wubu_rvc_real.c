@@ -284,8 +284,13 @@ static void conv1d_c_fused_impl(const float *in, int in_ch, int n,
     if (n_out <= 0) return;
     if (!resid) memset(out, 0, (size_t)out_ch * n_out * sizeof(float));
     if (out_ch >= 32) {
-        /* INPUT-STATIONARY tiled conv (same structure as conv1d_c). */
-        const int TILE = 8192;
+        /* INPUT-STATIONARY tiled conv (same structure as conv1d_c).
+         * TILE=2048: the MRF runs this at n≈8192, so each conv call has 4
+         * tiles for its 4 threads (TILE=8192 gave 1 tile → convs were serial
+         * per stack; measured 25.82 → 25.04s at jobs=4, 2026-08-09). Tiles
+         * only partition the j loop — accumulation order per output element
+         * is unchanged, so parity holds to ~1 ulp at tile boundaries. */
+        const int TILE = 2048;
 #pragma omp parallel for schedule(dynamic, 4) num_threads(omp_in_parallel() ? 4 : 12) if(n_out >= TILE)
         for (int jb = 0; jb < n_out; jb += TILE) {
             int j_hi = jb + TILE < n_out ? jb + TILE : n_out;

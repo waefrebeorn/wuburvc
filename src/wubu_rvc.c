@@ -73,7 +73,7 @@ static int rvc_build_graph(WuBuRVC *rvc) {
      * We reinterpret RVC's tensor names into our own execution order. */
 
     /* Check for CUDA via nvidia-smi */
-    FILE *f = popen("nvidia-smi --query-gpu=name --format=csv,noheader 2>nul", "r");
+    FILE *f = popen("nvidia-smi --query-gpu=name --format=csv,noheader 2>tmp.log", "r");
     if (f) {
         if (fgets(rvc->cuda_device_name, sizeof(rvc->cuda_device_name), f)) {
             char *nl = strchr(rvc->cuda_device_name, '\n');
@@ -382,25 +382,40 @@ WuBuRVC *wubu_rvc_load(const RVCConfig *cfg) {
         rvc->model = (struct WuBuRVCModel *)wubu_rvc_load_model(cfg->model_path);
         if (rvc->model) {
             /* Generate .bin from .pth if it doesn't exist (uses torch bridge).
-             * Look for the WuBuMedia venv Python, then system python. */
+             * Look for the WuBuMedia venv Python, then system python.
+             * PATHS MUST BE BACKSLASH for cmd.exe (system() = cmd on Windows;
+             * forward slashes fail with "filename syntax is incorrect").
+             * The detection command also needs 2>tmp.log (cmd syntax), NOT
+             * 2>/dev/null (sh syntax — redirects to \dev\null and always
+             * fails, silently falling back to bare "python" which is not on
+             * PATH for cmd → every .pth got ".bin generation skipped"). */
             const char *py_candidates[] = {
                 getenv("WUBU_PYTHON"),
-                "C:/Users/eman5/WuBuMedia/.venv_win/Scripts/python.exe",
-                "/c/Users/eman5/WuBuMedia/.venv_win/Scripts/python.exe",
+                "C:\\Users\\eman5\\WuBuMedia\\.venv_win\\Scripts\\python.exe",
+                "C:\\Users\\eman5\\wuburvc\\.venv_win\\Scripts\\python.exe",
+                "C:\\Users\\eman5\\WuBuRVC\\.venv_win\\Scripts\\python.exe",
                 "python",
                 NULL
             };
             const char *py = NULL;
-            for (int pi = 0; py_candidates[pi] && !py; pi++) {
-                if (py_candidates[pi] && strlen(py_candidates[pi]) > 0) {
-                    /* Check if this Python exists */
-                    char test[512];
-                    snprintf(test, sizeof(test), "\"%s\" -c \"import torch\" 2>nul",
-                             py_candidates[pi]);
-                    if (system(test) == 0) {
-                        py = py_candidates[pi];
-                    }
-                }
+            int n_py = (int)(sizeof(py_candidates) / sizeof(py_candidates[0]));
+            for (int pi = 0; pi < n_py; pi++) {
+                /* WUBU_PYTHON unset → entry 0 is NULL. Skip it; do NOT let
+                 * the array-sentinel NULL stop the scan (the old
+                 * `for (...; py_candidates[pi]; ...)` never probed the venv
+                 * paths and fell back to bare "python" → rc=1 → every .pth
+                 * got ".bin generation skipped"). */
+                if (!py_candidates[pi] || !py_candidates[pi][0]) continue;
+                /* Probe with a FILE-EXISTS check, not system() — the
+                 * `-c "import torch"` probe breaks under cmd.exe's quote
+                 * mangling ("not recognized as internal or external"),
+                 * which silently fell back to bare "python" (not on PATH
+                 * for cmd) → every .pth got ".bin generation skipped". */
+                FILE *tf = fopen(py_candidates[pi], "rb");
+                if (getenv("WUBU_DEBUG_BRIDGE"))
+                    fprintf(stderr, "[pyprobe %d] '%s' -> %s\n", pi,
+                            py_candidates[pi], tf ? "FOUND" : "missing");
+                if (tf) { fclose(tf); py = py_candidates[pi]; break; }
             }
             if (!py) py = "python";
     /* Look for pre-generated .bin — try model_dir/basename.weights.bin */
@@ -464,14 +479,63 @@ WuBuRVC *wubu_rvc_load(const RVCConfig *cfg) {
                     strncpy(bin_path, fallback, sizeof(bin_path) - 1);
                     bin_path[sizeof(bin_path) - 1] = 0;
                 } else {
-                    /* .bin doesn't exist — try to generate via Python bridge */
-                    char cmd[2048];
-                    snprintf(cmd, sizeof(cmd),
-                             "\"%s\" tools/extract_rvc_weights.py \"%s\" \"%s\" 2>/dev/null",
-                             py, cfg->model_path, bin_path);
-                    int rc = system(cmd);
-                    if (rc != 0) {
-                        fprintf(stderr, "WuBuRVC: .bin generation skipped (rc=%d)\n", rc);
+                    /* .bin doesn't exist — generate via the Python bridge.
+                     * ROOT CAUSE FIX (2026-08-09): the old relative script
+                     * path AND forward-slash absolute paths both fail under
+                     * cmd.exe (system() uses cmd on Windows, NOT sh):
+                     *   - "tools/extract_rvc_weights.py" broke when CWD != repo
+                     *   - "C:/Users/..." forward slashes → "filename syntax
+                     *     is incorrect" (cmd needs backslashes)
+                     *   - "2>/dev/null" is sh syntax → cmd redirects to the
+                     *     invalid path \dev\null → "cannot find the path"
+                     * Backslash absolute paths + 2>tmp.log work (verified via
+                     * .bat: RC=0, 180MB bin produced). */
+                    const char *cands[] = {
+                        "C:\\Users\\eman5\\wuburvc\\tools\\extract_rvc_weights.py",
+                        "C:\\Users\\eman5\\WuBuRVC\\tools\\extract_rvc_weights.py",
+                        "C:\\Users\\eman5\\WuBuMedia\\tools\\extract_rvc_weights.py",
+                        NULL
+                    };
+                    const char *script_path = NULL;
+                    for (int si = 0; cands[si]; si++) {
+                        FILE *tf = fopen(cands[si], "rb");
+                        if (tf) { fclose(tf); script_path = cands[si]; break; }
+                    }
+                    if (script_path) {
+                        /* Convert model/bin paths to ABSOLUTE backslash paths
+                         * for cmd.exe — relative paths ("../models/...") and
+                         * forward slashes both break system() on Windows. */
+                        char model_b[800], bin_b[800];
+                        char model_abs[800] = {0}, bin_abs[800] = {0};
+                        _fullpath(model_abs, cfg->model_path, sizeof(model_abs));
+                        _fullpath(bin_abs, bin_path, sizeof(bin_abs));
+                        for (size_t i = 0; i < strlen(model_abs) && i < sizeof(model_b) - 1; i++)
+                            model_b[i] = (model_abs[i] == '/') ? '\\' : model_abs[i];
+                        model_b[strlen(model_abs) < sizeof(model_b) - 1 ?
+                                strlen(model_abs) : sizeof(model_b) - 1] = 0;
+                        for (size_t i = 0; i < strlen(bin_abs) && i < sizeof(bin_b) - 1; i++)
+                            bin_b[i] = (bin_abs[i] == '/') ? '\\' : bin_abs[i];
+                        bin_b[strlen(bin_abs) < sizeof(bin_b) - 1 ?
+                              strlen(bin_abs) : sizeof(bin_b) - 1] = 0;
+                        char cmd[2048];
+                        /* cmd.exe /c quote trap (FIXED 2026-08-09): with
+                         * multiple quoted segments ("py" "script" ...) and
+                         * NOT ending in a quote, cmd's parser mangles the
+                         * line → rc=1, "The filename, directory name, or
+                         * volume label syntax is incorrect". Wrap the WHOLE
+                         * command in an extra pair of quotes — cmd strips
+                         * first+last and re-parses correctly. */
+                        snprintf(cmd, sizeof(cmd),
+                                 "\"\"%s\" \"%s\" \"%s\" \"%s\" 2>nul\"",
+                                 py, script_path, model_b, bin_b);
+                        if (getenv("WUBU_DEBUG_BRIDGE"))
+                            fprintf(stderr, "[bridge] %s\n", cmd);
+                        int rc = system(cmd);
+                        if (rc != 0) {
+                            fprintf(stderr, "WuBuRVC: .bin generation skipped (rc=%d)\n", rc);
+                        }
+                    } else {
+                        fprintf(stderr, "WuBuRVC: extract_rvc_weights.py not found\n");
                     }
                 }
             }

@@ -1,4 +1,4 @@
-# 50 CPU Speed Fixes — RVC Engine (researched 2026-08-08, 30 web searches)
+# 51 fixes — CPU Speed Research (researched 2026-08-08, 30+ web searches + 1 video deep-dive)
 
 The boss's "seven steps to Kevin Bacon" research cascade: conv micro-kernels →
 GEMM → memory layout → threading → precision → math → compiler → pipeline.
@@ -116,6 +116,20 @@ Every fix cites its source. Items marked **DONE** are already in wuburvc.
     not compute-dominated (Streaming Vocos: 3.4ms/chunk). [StreamingVocos]
 50. **Async I/O + double buffering** — read the next chunk while the
     workers process the current one. [switchboard.audio voice-ai-latency]
+
+## H. THE FOLDED POLYNOMIAL (#51 — the pivotal, from Kaze Emanuar's video)
+51. **Folded polynomial for sin/cos** (Silas Lock via "The Folded Polynomial —
+    N64 Optimization", youtu.be/hffgNRfL1XY): use the wave's symmetry to
+    shrink the poly's domain to ONE EIGHTH ([0, π/4]), then a LOWER-order
+    polynomial beats a higher-order one on accuracy (halving the range gives
+    2^(order+1)× accuracy). sin/cos pair from ONE tiny poly + sqrt(1−x²) —
+    the sqrt keeps the pair exactly normalized. N64 result: 3x accuracy at
+    1.5 cycles faster; 4th-order version: 90x accuracy.
+    **For WuBuRVC**: 148,000 sinf/chunk in the NSF sine excitation
+    (wubu_rvc_real.c:1102) + the snake's 2 sinf/element + STFT windows.
+    AVX2 folded pair = ~10 FMA + 1 sqrt → 2-4x over libm sinf at BETTER
+    accuracy. Full deep-dive: knowledge/FOLDED_POLYNOMIAL.md (impl plan +
+    research trail). [KazeN64 hffgNRfL1XY; pvk.ca sinf polys; FABE13-HX]
 
 ## The RVC-specific answer (from the community)
 RVC 10.6's "secret sauce" (issue #1434, yxlllc): the speed was always

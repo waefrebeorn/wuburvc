@@ -39,6 +39,7 @@
 #include <time.h>
 #include <pthread.h>
 #include <omp.h>
+#include <immintrin.h>
 #include "wubu_postproc.h"
 
 static void die(const char *msg) { fprintf(stderr, "wubu_rvc_cli: %s\n", msg); exit(1); }
@@ -233,6 +234,14 @@ static void *chunk_worker(void *arg) {
 }
 
 int main(int argc, char **argv) {
+    /* Nested OMP: the MRF's 3 stacks run in parallel, each with its own conv
+     * threads (3 stacks x 4 conv threads = 12). */
+    omp_set_nested(1);
+    omp_set_max_active_levels(2);
+    omp_set_num_threads(12);
+    /* FTZ + DAZ: flush denormals (the RVC's tiny activations create them in
+     * the conv accumulation — denormal FP ops are ~100x slower on x86) */
+    _mm_setcsr(_mm_getcsr() | (1u << 15) | (1u << 6));
     setvbuf(stdout, NULL, _IONBF, 0); /* crash-safe stage logging */
     setvbuf(stderr, NULL, _IONBF, 0);
     if (argc < 4) {

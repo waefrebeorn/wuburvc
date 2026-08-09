@@ -19,6 +19,7 @@
 #include <math.h>
 #include <time.h>
 #include <immintrin.h>
+#include <omp.h>
 
 /* Uniform random in [lo, hi) — used for NSF noise injection */
 static inline float wubu_rand_uniform(float lo, float hi) {
@@ -80,10 +81,10 @@ static float *denorm_cache(const WuBuRVCModel *m, const char *base,
  * oc → j → tap → ic order touched in_ch rows of 11KB+ each per output sample
  * (thousands of cache misses per position); for T=111k × 512ch that was the
  * dominant cost of the whole engine. */
-static void conv1d_c(const float *in, int in_ch, int n,
-                     const float *w, const float *b,
-                     int out_ch, int k, int stride, int pad, int dil,
-                     float *out) {
+void conv1d_c(const float *in, int in_ch, int n,
+              const float *w, const float *b,
+              int out_ch, int k, int stride, int pad, int dil,
+              float *out) {
     int n_out = (n + 2 * pad - dil * (k - 1) - 1) / stride + 1;
     if (n_out <= 0) return;
     memset(out, 0, (size_t)out_ch * n_out * sizeof(float));
@@ -94,7 +95,7 @@ static void conv1d_c(const float *in, int in_ch, int n,
          * tile the SEQUENCE: each thread loads its input tile once and
          * accumulates into ALL output channels. */
         const int TILE = 8192;
-#pragma omp parallel for schedule(dynamic, 4) if(n_out >= TILE)
+#pragma omp parallel for schedule(dynamic, 4) num_threads(omp_in_parallel() ? 4 : 12) if(n_out >= TILE)
         for (int jb = 0; jb < n_out; jb += TILE) {
             int j_hi = jb + TILE < n_out ? jb + TILE : n_out;
             for (int oc = 0; oc < out_ch; oc++) {
@@ -102,6 +103,83 @@ static void conv1d_c(const float *in, int in_ch, int n,
                 float bias = b ? b[oc] : 0.0f;
                 const float *wv = w + (size_t)oc * in_ch * k;
                 for (int j = jb; j < j_hi; j++) orow[j] += bias;
+#if defined(__AVX2__) && defined(__FMA__)
+                if (stride == 1 && in_ch >= 8 && k >= 1) {
+                    /* REGISTER-ACCUMULATED AVX2: the whole (ic,tap)
+                     * accumulation happens INSIDE each 32-sample block — orow
+                     * is loaded+stored once per block instead of once per
+                     * (ic,tap). Eliminates ~768x redundant orow traffic, the
+                     * MRF's dominant cost. Runs INSTEAD of the (ic,tap) loops
+                     * below. */
+                    int j_in_lo = jb < pad ? pad : jb;
+                    int j_in_hi = n - (k - 1) * dil + pad;
+                    if (j_in_hi > j_hi) j_in_hi = j_hi;
+                    /* left boundary: full (ic,tap) sum, bounds-checked */
+                    for (int j = jb; j < j_in_lo && j < j_hi; j++) {
+                        float acc = orow[j];
+                        for (int ick = 0; ick < in_ch; ick++) {
+                            const float *ir2 = in + (size_t)ick * n;
+                            const float *wv2 = wv + (size_t)ick * k;
+                            for (int tap = 0; tap < k; tap++) {
+                                int src = j + tap * dil - pad;
+                                if (src >= 0 && src < n) acc += ir2[src] * wv2[tap];
+                            }
+                        }
+                        orow[j] = acc;
+                    }
+                    /* interior: all taps valid; register-blocked */
+                    int jr_max = n - 32 - (k - 1) * dil + pad;
+                    if (jr_max > j_in_hi - 32) jr_max = j_in_hi - 32;
+                    int jr = j_in_lo;
+                    for (; jr <= jr_max; jr += 32) {
+                        __m256 a0 = _mm256_loadu_ps(orow + jr);
+                        __m256 a1 = _mm256_loadu_ps(orow + jr + 8);
+                        __m256 a2 = _mm256_loadu_ps(orow + jr + 16);
+                        __m256 a3 = _mm256_loadu_ps(orow + jr + 24);
+                        for (int ick = 0; ick < in_ch; ick++) {
+                            const float *ir2 = in + (size_t)ick * n + jr - pad;
+                            const float *wv2 = wv + (size_t)ick * k;
+                            for (int tap = 0; tap < k; tap++) {
+                                __m256 wv8 = _mm256_set1_ps(wv2[tap]);
+                                a0 = _mm256_fmadd_ps(_mm256_loadu_ps(ir2 + tap * dil), wv8, a0);
+                                a1 = _mm256_fmadd_ps(_mm256_loadu_ps(ir2 + 8 + tap * dil), wv8, a1);
+                                a2 = _mm256_fmadd_ps(_mm256_loadu_ps(ir2 + 16 + tap * dil), wv8, a2);
+                                a3 = _mm256_fmadd_ps(_mm256_loadu_ps(ir2 + 24 + tap * dil), wv8, a3);
+                            }
+                        }
+                        _mm256_storeu_ps(orow + jr, a0);
+                        _mm256_storeu_ps(orow + jr + 8, a1);
+                        _mm256_storeu_ps(orow + jr + 16, a2);
+                        _mm256_storeu_ps(orow + jr + 24, a3);
+                    }
+                    for (; jr + 8 <= j_in_hi && jr + 7 + (k - 1) * dil - pad < n; jr += 8) {
+                        __m256 a0 = _mm256_loadu_ps(orow + jr);
+                        for (int ick = 0; ick < in_ch; ick++) {
+                            const float *ir2 = in + (size_t)ick * n + jr - pad;
+                            const float *wv2 = wv + (size_t)ick * k;
+                            for (int tap = 0; tap < k; tap++) {
+                                a0 = _mm256_fmadd_ps(_mm256_loadu_ps(ir2 + tap * dil),
+                                                     _mm256_set1_ps(wv2[tap]), a0);
+                            }
+                        }
+                        _mm256_storeu_ps(orow + jr, a0);
+                    }
+                    /* right boundary + tail (full sum, bounds-checked) */
+                    for (; jr < j_hi; jr++) {
+                        float acc = orow[jr];
+                        for (int ick = 0; ick < in_ch; ick++) {
+                            const float *ir2 = in + (size_t)ick * n;
+                            const float *wv2 = wv + (size_t)ick * k;
+                            for (int tap = 0; tap < k; tap++) {
+                                int src = jr + tap * dil - pad;
+                                if (src >= 0 && src < n) acc += ir2[src] * wv2[tap];
+                            }
+                        }
+                        orow[jr] = acc;
+                    }
+                    continue; /* full (ic,tap) done — skip the per-tap loops */
+                }
+#endif
                 for (int ic = 0; ic < in_ch; ic++) {
                     const float *irow = in + (size_t)ic * n;
                     for (int tap = 0; tap < k; tap++) {
@@ -119,19 +197,7 @@ static void conv1d_c(const float *in, int in_ch, int n,
                         }
                         if (j_lo < jb) j_lo = jb;
                         if (j_lo < j_hi2) {
-#if defined(__AVX2__) && defined(__FMA__)
-                            if (stride == 1) {
-                                __m256 wv8 = _mm256_set1_ps(wt);
-                                int j = j_lo;
-                                const float *ir = irow + off;
-                                for (; j + 8 <= j_hi2; j += 8) {
-                                    __m256 iv = _mm256_loadu_ps(ir + j);
-                                    __m256 ov = _mm256_loadu_ps(orow + j);
-                                    _mm256_storeu_ps(orow + j, _mm256_fmadd_ps(iv, wv8, ov));
-                                }
-                                for (; j < j_hi2; j++) orow[j] += ir[j] * wt;
-                            } else
-#endif
+
                             for (int j = j_lo; j < j_hi2; j++)
                                 orow[j] += irow[j * stride + off] * wt;
                         }
@@ -310,6 +376,7 @@ static void mha_forward_t(const MHA *mha, const float *x, const float *c,
     conv1d_c(x, C, T, mha->wq, mha->bq, C, 1, 1, 0, 1, q);
     conv1d_c(c, C, T, mha->wk, mha->bk, C, 1, 1, 0, 1, k);
     conv1d_c(c, C, T, mha->wv, mha->bv, C, 1, 1, 0, 1, v);
+    if (getenv("WUBU_TIME_STAGES")) fprintf(stderr, "[mha] qkv done T=%d C=%d\n", T, C);
 
     /* scores[h][ti][tj] = sum_d q[h,d,ti]*k[h,d,tj] / sqrt(kch) */
 #pragma omp parallel for schedule(static)
@@ -326,6 +393,7 @@ static void mha_forward_t(const MHA *mha, const float *x, const float *c,
             }
         }
     }
+    if (getenv("WUBU_TIME_STAGES")) fprintf(stderr, "[mha] scores done\n");
 
     /* relative position bias (emb_rel_k, window=10): scores_local[t][s].
      * PyTorch: rel_logits = matmul(q/sqrt(kch), emb_used), then
@@ -351,6 +419,7 @@ static void mha_forward_t(const MHA *mha, const float *x, const float *c,
             }
         }
     }
+    if (getenv("WUBU_TIME_STAGES")) fprintf(stderr, "[mha] rel done\n");
 
     /* mask fill (-1e4) + softmax over tj */
 #pragma omp parallel for schedule(static)
@@ -372,12 +441,16 @@ static void mha_forward_t(const MHA *mha, const float *x, const float *c,
             for (int tj = 0; tj < T; tj++) srow[(size_t)ti * T + tj] /= (sum + 1e-12f);
         }
     }
+    if (getenv("WUBU_TIME_STAGES")) fprintf(stderr, "[mha] softmax done\n");
 
     /* out[h,d,ti] = sum_tj p_attn[h,ti,tj] * v[h,d,tj]  (+ relative values) */
 #pragma omp parallel for schedule(static)
     for (int h = 0; h < H; h++) {
         const float *srow = scores + (size_t)h * T * T;
+        if (getenv("WUBU_TIME_STAGES")) fprintf(stderr, "[mha] out h=%d start\n", h);
         for (int ti = 0; ti < T; ti++) {
+            if (getenv("WUBU_TIME_STAGES") && ti < 3)
+                fprintf(stderr, "[mha] out h=%d ti=%d\n", h, ti);
             for (int d = 0; d < kch; d++) {
                 float acc = 0;
                 for (int tj = 0; tj < T; tj++)
@@ -456,11 +529,14 @@ int wubu_enc_p_forward(WuBuRVCModel *model,
     if (!x || !xp || !tmp || !y) { free(x); free(xp); free(tmp); free(y); return -1; }
 
     linear_c(phone, content_dim, nF, emb_w->data, emb_b->data, hidden, x);
+    if (getenv("WUBU_TIME_STAGES")) fprintf(stderr, "[enc] linear done\n");
     embedding_c(pitch_w->data, 256, hidden, pitch, nF, xp);
+    if (getenv("WUBU_TIME_STAGES")) fprintf(stderr, "[enc] embedding done\n");
     for (int i = 0; i < hidden * nF; i++) {
         x[i] = (x[i] + xp[i]) * sqrtf((float)hidden);
     }
     lrelu_c(x, (size_t)hidden * nF, 0.1f);
+    if (getenv("WUBU_TIME_STAGES")) fprintf(stderr, "[enc] emb+lrelu done\n");
 
     /* x_mask: all ones (full length) */
     if (x_mask_out)
@@ -531,6 +607,7 @@ int wubu_enc_p_forward(WuBuRVCModel *model,
          * (the residual buffer) — passing (y, tmp) would add the PRE-conv_o
          * attention to x, which scrambles every channel. */
         mha_forward_t(&mha, x, x, attn_mask, nF, q, k, v, scores, tmp, y);
+        if (getenv("WUBU_TIME_STAGES")) fprintf(stderr, "[enc] L%d mha done\n", L);
 
         if (getenv("WUBU_RVC_DUMP")) {
             char fn[128];
@@ -878,6 +955,9 @@ int wubu_generator_nsf(WuBuRVCModel *model,
                        int inject_noise,
                        int use_snake)  /* BigVGAN Snake activation in MRF blocks */
 {
+    const int profiling = getenv("WUBU_TIME_STAGES") != NULL;
+    double t_convT = 0.0, t_mrf = 0.0, t_noise = 0.0, t_other = 0.0;
+    double t0_all = profiling ? omp_get_wtime() : 0.0;
     int nF = n_frames;
     if (getenv("WUBU_RVC_DUMP")) {
         /* training-pair hook: real generator input (flow output z, (192,T)) */
@@ -1054,6 +1134,7 @@ int wubu_generator_nsf(WuBuRVCModel *model,
 
         /* ups[L]: ConvTranspose1d(ups_in -> ups_out, k, rate, pad) weight_norm.
          * wubu_rvc_weights.c already pre-computes hifi_upsample_denorm[L]. */
+        double t_ct0 = profiling ? omp_get_wtime() : 0.0;
         char key[256];
         snprintf(key, sizeof(key), "dec.ups.%d.bias", L);
         const RVCTensor *ub = T(model, key);
@@ -1077,6 +1158,7 @@ int wubu_generator_nsf(WuBuRVCModel *model,
                                ub && ub->data ? ub->data : NULL,
                                ups_out[L], ups_k[L], ups_rate[L], ups_pad[L], stage[L]);
         }
+        if (profiling) t_convT += omp_get_wtime() - t_ct0;
 
         if (L == 0 && getenv("WUBU_DUMP_CPU")) {
             fprintf(stderr, "CPUUP0");
@@ -1131,6 +1213,7 @@ int wubu_generator_nsf(WuBuRVCModel *model,
          * inner convs). */
         {
             int ch = ups_out[L];
+            double t_m0 = profiling ? omp_get_wtime() : 0.0;
             int n_stacks = model->n_mrf_stacks;
             if (n_stacks < 1) n_stacks = 3; /* legacy no-config fallback */
             if (n_stacks > 8) n_stacks = 8;
@@ -1140,6 +1223,11 @@ int wubu_generator_nsf(WuBuRVCModel *model,
             /* per-stack accumulators — no shared writes. */
             float *acc = (float *)calloc((size_t)n_stacks * ch * next_n, sizeof(float));
             if (acc) {
+                /* the 3 stacks are INDEPENDENT (same stage input, different
+                 * weights) — run them in parallel. Nested OMP (set in main):
+                 * each stack thread gets its own conv parallelism via the
+                 * conv1d_c num_threads(omp_in_parallel() ? 4 : 12). */
+#pragma omp parallel for schedule(static) num_threads(n_stacks) if(n_stacks >= 2)
                 for (int s = 0; s < n_stacks; s++) {
                     char key[256];
                     float *acc_s = acc + (size_t)s * ch * next_n;
@@ -1199,6 +1287,7 @@ int wubu_generator_nsf(WuBuRVCModel *model,
                         s += acc[(size_t)st * ch * next_n + i];
                     stage[L][i] = s / (float)n_stacks;
                 }
+                if (profiling) t_mrf += omp_get_wtime() - t_m0;
                 if (L == 0 && getenv("WUBU_DUMP_CPU")) {
                     fprintf(stderr, "CPUM0B");
                     for (int q = 0; q < 8; q++) fprintf(stderr, " %.3f", stage[0][q]);
@@ -1264,6 +1353,12 @@ int wubu_generator_nsf(WuBuRVCModel *model,
     }
 
     free(stage[3]); free(sine);
+    if (profiling) {
+        fprintf(stderr, "[gen-time] convT=%.2fs mrf=%.2fs total=%.2fs (convT %.0f%% mrf %.0f%%)\n",
+                t_convT, t_mrf, omp_get_wtime() - t0_all,
+                100.0 * t_convT / (omp_get_wtime() - t0_all + 1e-9),
+                100.0 * t_mrf / (omp_get_wtime() - t0_all + 1e-9));
+    }
     if (getenv("WUBU_RVC_DUMP")) {
         FILE *df = fopen("outputs/rvc_ref/c_gen_output.npy", "wb");
         if (df) {
@@ -1311,6 +1406,7 @@ int wubu_rvc_synthesize_real(WuBuRVCModel *model,
                            f0_coarse, m, logs, x_mask) != 0) {
         free(m); free(logs); free(x_mask); free(z_p); free(z); return -1;
     }
+    if (getenv("WUBU_TIME_STAGES")) fprintf(stderr, "[synth] enc_p done\n");
 
     /* Debug: WUBU_RVC_DUMP=1 writes intermediates as raw float files */
     if (getenv("WUBU_RVC_DUMP")) {
@@ -1352,6 +1448,7 @@ int wubu_rvc_synthesize_real(WuBuRVCModel *model,
     if (wubu_flow_reverse(model, z_p, n_frames, inter, g, x_mask, z) != 0) {
         free(m); free(logs); free(x_mask); free(z_p); free(z); return -1;
     }
+    if (getenv("WUBU_TIME_STAGES")) fprintf(stderr, "[synth] flow done\n");
 
     if (getenv("WUBU_RVC_DUMP")) {
         FILE *df = fopen("outputs/rvc_ref/c_inter_z_p.npy", "wb");

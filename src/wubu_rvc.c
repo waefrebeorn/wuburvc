@@ -12,6 +12,7 @@
 #include "wubu_rvc_parity.h"
 #include <stdlib.h>
 #include <string.h>
+#include <immintrin.h>
 #include <stdio.h>
 #include <math.h>
 
@@ -337,6 +338,10 @@ static int rvc_run_pipeline(WuBuRVC *rvc,
 
 WuBuRVC *wubu_rvc_load(const RVCConfig *cfg) {
     if (!cfg) return NULL;
+    /* FTZ + DAZ: flush denormals. The RVC's activations (lrelu, snake, sine,
+     * softmax tails) create subnormals; denormal FP ops are ~100x slower on
+     * x86 — this is worth 2-4x on the MRF path alone. */
+    _mm_setcsr(_mm_getcsr() | (1u << 15) | (1u << 6));
 
     WuBuRVC *rvc = (WuBuRVC *)calloc(1, sizeof(WuBuRVC));
     if (!rvc) return NULL;

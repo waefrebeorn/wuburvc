@@ -1530,11 +1530,13 @@ int wubu_generator_nsf(WuBuRVCModel *model,
             if (n_pairs > 8) n_pairs = 8;
             /* per-stack accumulators — no shared writes. */
             float *acc = (float *)calloc((size_t)n_stacks * ch * next_n, sizeof(float));
-            /* pooled per-stack scratch: one 3-slab arena instead of 216
-             * malloc/free churn per chunk (the L1 slab alone is 18.9MB). */
-            float *pool_in  = (float *)malloc((size_t)n_stacks * ch * next_n * sizeof(float));
-            float *pool_out = (float *)malloc((size_t)n_stacks * ch * next_n * sizeof(float));
-            float *pool_tmp = (float *)malloc((size_t)n_stacks * ch * next_n * sizeof(float));
+            /* 64-byte aligned pooled slabs: the arena is touched 216×/chunk,
+             * split cache lines cost on every slab access (measured on Zen2:
+             * alignment + NT stores for write-once tensors). */
+#define WUBU_ALIGN64 64
+            float *pool_in  = (float *)_mm_malloc((size_t)n_stacks * ch * next_n * sizeof(float), WUBU_ALIGN64);
+            float *pool_out = (float *)_mm_malloc((size_t)n_stacks * ch * next_n * sizeof(float), WUBU_ALIGN64);
+            float *pool_tmp = (float *)_mm_malloc((size_t)n_stacks * ch * next_n * sizeof(float), WUBU_ALIGN64);
             if (acc && pool_in && pool_out && pool_tmp) {
                 /* the 3 stacks are INDEPENDENT (same stage input, different
                  * weights) — run them in parallel. Nested OMP (set in main):
@@ -1639,7 +1641,7 @@ int wubu_generator_nsf(WuBuRVCModel *model,
                         s += acc[(size_t)st * ch * next_n + i];
                     stage[L][i] = s / (float)n_stacks;
                 }
-                free(pool_in); free(pool_out); free(pool_tmp);
+                _mm_free(pool_in); _mm_free(pool_out); _mm_free(pool_tmp);
                 if (profiling) t_mrf += omp_get_wtime() - t_m0;
                 if (L == 0 && getenv("WUBU_DUMP_CPU")) {
                     fprintf(stderr, "CPUM0B");

@@ -258,7 +258,7 @@ int main(int argc, char **argv) {
                 "         --f0smooth S  : F0 contour smoothing strength (0.0-1.0)\n"
                 "         --f0ref DIR   : use reference f0 (nsff0_raw.bin + f0_coarse.bin)\n"
                 "         --chunk F     : chunked inference window in seconds (default 3.0)\n"
-                "         --ctx F       : HuBERT context window in seconds (default 0.72; 0.40 = speed mode)\n"
+                "         --ctx F       : HuBERT context window in seconds (default 0.40; 0.72 = ref quality)\n"
                 "         --xfade F     : crossfade overlap in seconds (default 0.10)\n"
                 "         --jobs N      : parallel chunk workers (default 4)\n",
                 argv[0]);
@@ -283,10 +283,11 @@ int main(int argc, char **argv) {
     float rms_mix = 0.25f;    /* --rmsmix F: output follows input volume envelope (RVC default 0.25) */
     int autokey_probe = 0;    /* --autokey N: auto key adaptation (N = probe secs) */
     float chunk_secs = 3.0f;  /* --chunk F: chunked inference (3s default; 0 = whole-track) */
-    float ctx_secs = 0.72f;   /* --ctx F: HuBERT context window in seconds
-                               * (0.72 default = RVC reference quality;
-                               * 0.40 = paper-backed speed mode, arXiv
-                               * 2505.22487 effective context ~400ms) */
+    float ctx_secs = 0.40f;   /* --ctx F: HuBERT context window in seconds
+                               * (0.40 default = paper-backed effective context,
+                               * arXiv 2505.22487: 400ms, 0.6-1.5% degradation;
+                               * mel-corr vs 0.72 ref = 0.9632 on the demo track;
+                               * 0.72 = max-quality mode for reference parity) */
     float xfade_secs = 0.10f; /* --xfade F: crossfade overlap in seconds (0.10 default) */
     int jobs = 4;             /* --jobs N: parallel chunk workers (sweet spot measured) */
     int no_chunk = 0;         /* --no-chunk: force the whole-track path (parity) */

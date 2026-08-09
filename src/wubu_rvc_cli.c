@@ -555,6 +555,11 @@ int main(int argc, char **argv) {
             printf("[5] yin f0 frames: %d\n", n_f0);
         }
         if (rm) wubu_rmvpe_free(rm);
+        if (getenv("WUBU_DUMP_F0")) {
+            FILE *df = fopen("f0_ours.bin", "wb");
+            if (df) { fwrite(f0, sizeof(float), (size_t)n_f0, df); fclose(df); }
+            fprintf(stderr, "[f0dump] wrote f0_ours.bin (%d frames)\n", n_f0);
+        }
         /* filter_radius median — kills octave jumps that make singing
          * off-key while preserving vibrato (RVC default radius 3). */
         if (f0_filter_radius > 0 && n_f0 > 0) {
@@ -564,6 +569,13 @@ int main(int argc, char **argv) {
         f0_coarse = (int *)malloc((size_t)(n_f0 + 2) * sizeof(int));
         nsff0 = (float *)malloc((size_t)(n_f0 + 2) * sizeof(float));
         wubu_f0_to_coarse(f0, n_f0, 50.0f, 1100.0f, f0_coarse, nsff0);
+        if (getenv("WUBU_DUMP_F0")) {
+            FILE *dc = fopen("f0coarse_ours.bin", "wb");
+            if (dc) { fwrite(f0_coarse, sizeof(int), (size_t)n_f0, dc); fclose(dc); }
+            FILE *dn = fopen("nsff0_ours.bin", "wb");
+            if (dn) { fwrite(nsff0, sizeof(float), (size_t)n_f0, dn); fclose(dn); }
+            fprintf(stderr, "[f0dump] wrote f0coarse_ours.bin + nsff0_ours.bin (%d frames)\n", n_f0);
+        }
         n_f0_2 = n_f0;
     }
 

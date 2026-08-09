@@ -1356,6 +1356,10 @@ int wubu_generator_nsf(WuBuRVCModel *model,
     }
 
     if (getenv("WUBU_RVC_DUMP")) {
+        FILE *df = fopen("outputs/rvc_ref/c_gen_pre_raw.npy", "wb");
+        if (df) { fwrite(x, sizeof(float), (size_t)init_ch * nF, df); fclose(df); }
+    }
+    if (getenv("WUBU_RVC_DUMP")) {
         FILE *df = fopen("outputs/rvc_ref/c_gen_pre.npy", "wb");
         if (df) { fwrite(x, sizeof(float), (size_t)init_ch * nF, df); fclose(df); }
     }

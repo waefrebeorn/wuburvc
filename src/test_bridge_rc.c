@@ -30,10 +30,10 @@ static int file_exists(const char *p) {
 }
 
 int main(void) {
-    const char *py      = "C:\\Users\\eman5\\WuBuMedia\\.venv_win\\Scripts\\python.exe";
-    const char *script  = "C:\\Users\\eman5\\wuburvc\\tools\\extract_rvc_weights.py";
-    const char *model   = "C:\\Users\\eman5\\WuBuMedia\\models\\rvc\\mj83k\\model.pth";
-    const char *bin     = "C:\\Users\\eman5\\WuBuMedia\\models\\rvc\\mj83k\\model.pth.weights.bin";
+    const char *py      = "C:\\\\Users\\\\eman5\\\\wuburvc\\\\.venv_win\\\\Scripts\\\\python.exe";
+    const char *script  = "C:\\\\Users\\\\eman5\\\\wuburvc\\\\tools\\\\extract_rvc_weights.py";
+    const char *model   = "C:\\\\Users\\\\eman5\\\\wuburvc\\\\models\\\\rvc\\\\mj83k\\\\model.pth";
+    const char *bin     = "C:\\\\Users\\\\eman5\\\\wuburvc\\\\models\\\\rvc\\\\mj83k\\\\model.pth.weights.bin";
 
     /* Skip if prerequisites aren't present (e.g. CI without the model). */
     if (!file_exists(py) || !file_exists(script) || !file_exists(model)) {

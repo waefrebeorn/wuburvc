@@ -1,0 +1,120 @@
+#version 450
+/* Tiled stride-1 conv1d with shared-memory input+weight tiles, 4-oc register
+ * blocking per thread. Selected by the host for stride==1 convs (conv_pre,
+ * all MRF convs, conv_post) — the ~95% of MACs in the generator.
+ *
+ * Workgroup = 128 j positions x 1 = 128 threads; each thread computes 4 output
+ * channels for its j. Weight tile [4 oc][16 ic][12 tap] + input tile
+ * [16 ic][194 src] live in shared memory; ic is processed in 16-channel
+ * chunks so smem stays under 32KB regardless of in_ch (192/256/512...).
+ *
+ * Same accumulation order as the CPU/PyTorch reference: bias first, then
+ * ic ascending, tap ascending, src = j + tap*dil - pad. Epilogue (lrelu /
+ * tanh / none) applied in the store when pc.epi != 0, saving a whole
+ * separate act dispatch + global round trip per conv.
+ */
+layout(local_size_x = 128) in;
+
+layout(set = 0, binding = 0) buffer InBuf  { float in_f[]; };   /* [in_ch * n] */
+layout(set = 0, binding = 1) buffer WBuf   { float w_f[]; };    /* [out_ch * in_ch * k] */
+layout(set = 0, binding = 2) buffer BBuf   { float b_f[]; };    /* [out_ch] */
+layout(set = 0, binding = 3) buffer OutBuf { float out_f[]; };  /* [out_ch * n_out] */
+
+layout(push_constant) uniform PC {
+    int in_ch;
+    int n;
+    int out_ch;
+    int k;
+    int stride;    /* must be 1 (host guarantees) */
+    int pad;
+    int dil;
+    int n_out;
+    int epi;       /* 0 none, 1 lrelu(0.1), 2 tanh */
+} pc;
+
+#define ICB 16
+#define KMAX 12
+#define SPAN 194   /* 128 + (KMAX-1)*DILMAX(6) + margin */
+
+shared float sin_tile[ICB][SPAN];
+shared float sw_tile[4][ICB][KMAX];
+
+void main() {
+    int j0 = int(gl_LocalInvocationID.x);        /* 0..127 within tile — MUST be
+                                                  * local, not global: for workgroup
+                                                  * X=1 global.x=128..255, which would
+                                                  * make j0/tid 128..255, skip the first
+                                                  * half of the smem cooperative loops
+                                                  * and double up jg (bug: X=1 output
+                                                  * all zeros). */
+    int jg = int(gl_WorkGroupID.x) * 128 + j0;   /* global output j */
+    /* NOTE: NO early return here — ALL threads must reach every barrier().
+     * Out-of-range jg reads zeroed smem and its store is guarded below. */
+
+    int ocg_base = int(gl_WorkGroupID.y) * 4;    /* this workgroup's 4 oc */
+    float acc[4];
+    for (int o = 0; o < 4; o++) acc[o] = 0.0;
+    int oc0 = ocg_base;
+    if (oc0 < pc.out_ch) {
+        for (int o = 0; o < 4; o++)
+            if (ocg_base + o < pc.out_ch) acc[o] = b_f[ocg_base + o];
+    }
+
+    int tid = j0;                                /* 0..127 */
+    int jmin = int(gl_WorkGroupID.x) * 128;
+    int imin = jmin - pc.pad;                    /* stride=1 */
+
+    for (int icb = 0; icb < pc.in_ch; icb += ICB) {
+        int ic_rem = pc.in_ch - icb;
+        if (ic_rem > ICB) ic_rem = ICB;
+
+        /* cooperative zero + load input tile (16 ic x SPAN src) */
+        for (int idx = tid; idx < ICB * SPAN; idx += 128) {
+            int r = idx / SPAN, c = idx % SPAN;
+            sin_tile[r][c] = 0.0;
+        }
+        for (int idx = tid; idx < ICB * SPAN; idx += 128) {
+            int r = idx / SPAN, c = idx % SPAN;
+            int ic = icb + r;
+            int src = imin + c;
+            if (ic < pc.in_ch && src >= 0 && src < pc.n)
+                sin_tile[r][c] = in_f[ic * pc.n + src];
+        }
+        /* cooperative load weight tile [4 oc][ICB ic][KMAX tap] */
+        for (int idx = tid; idx < 4 * ICB * KMAX; idx += 128) {
+            int o = idx / (ICB * KMAX);
+            int rem = idx % (ICB * KMAX);
+            int ic = rem / KMAX, t = rem % KMAX;
+            int oc = ocg_base + o;
+            if (t < pc.k && ic + icb < pc.in_ch && oc < pc.out_ch)
+                sw_tile[o][ic][t] = w_f[(oc * pc.in_ch + (ic + icb)) * pc.k + t];
+        }
+        barrier();
+
+        /* accumulate: 4 oc x ICB ic x k taps from smem */
+        for (int ic = 0; ic < ic_rem; ic++) {
+            for (int t = 0; t < pc.k; t++) {
+                float xv = sin_tile[ic][j0 + t * pc.dil];
+                for (int o = 0; o < 4; o++)
+                    acc[o] += xv * sw_tile[o][ic][t];
+            }
+        }
+        barrier();   /* don't overwrite smem until all threads consumed it */
+    }
+
+    if (jg >= pc.n_out) return;   /* store guard only — after all barriers */
+
+    /* epilogue + store */
+    for (int o = 0; o < 4; o++) {
+        int oc = ocg_base + o;
+        if (oc >= pc.out_ch) continue;
+        float v = acc[o];
+        if (pc.epi == 1) v = v > 0.0 ? v : v * 0.1;      /* lrelu 0.1 */
+        else if (pc.epi == 2) v = tanh(v);
+        else if (pc.epi == 3) {                          /* snake (a=1) */
+            float s = sin(v);
+            v = v + (1.0 / max(1.0 * 2.0, 1e-6)) * s * s;
+        }
+        out_f[oc * pc.n_out + jg] = v;
+    }
+}

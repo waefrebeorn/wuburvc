@@ -77,6 +77,32 @@ int wubu_train_step(WuBuRVCModel *model, WuBuTrainRegistry *reg, WuBuAdamW *opt,
                     const float *wav, int n_samples,
                     float *loss_out, int epoch);
 
+/* ── CUDA-accelerated training (wubu_train_cuda.cu).
+ * Same math as wubu_train_step but the decoder forward runs on the GPU
+ * with cached pre-activations, and the backward conv/convT kernels run on
+ * the GPU; grads are pulled back to the host registry per step, then the
+ * host AdamW updates (weights live on host — the model is always
+ * synthesis-ready). Opaque cache type for ABI safety. */
+typedef struct TrainCacheCuda TrainCacheCuda;
+
+int  wubu_train_forward_cuda(WuBuRVCModel *model, const float *mel_in, int n_frames,
+                             float *audio, int max_samples, TrainCacheCuda *cache);
+TrainCacheCuda *wubu_train_cache_alloc_cuda(void);
+void wubu_train_cache_free_cuda(TrainCacheCuda *cache);
+int  wubu_train_backward_cuda(WuBuRVCModel *model, TrainCacheCuda *cache,
+                              const float *mel_in, const float *d_audio,
+                              WuBuTrainRegistry *reg);
+int  wubu_train_step_cuda(WuBuRVCModel *model, WuBuTrainRegistry *reg, WuBuAdamW *opt,
+                          const float *mel_in, int n_frames,
+                          const float *wav, int n_samples,
+                          float *loss_out, int epoch);
+
+/* Public wrapper around the static decoder_backward (Triple-DA A/B for the
+ * CUDA training backend). Returns sample count or -1. */
+int wubu_train_backward_cpu(WuBuRVCModel *model, const float *mel_in, int n_frames,
+                            const float *wav, int n_samples,
+                            WuBuTrainRegistry *reg);
+
 /* ── Gradient check vs finite differences (Triple-DA).
  * Probes up to n_probes random weights; returns max relative error
  * (a value < 1e-3 means the analytic backward is correct). */

@@ -623,3 +623,8 @@ fail:
     cudaStreamDestroy(st);
     return -1;
 }
+
+/* ── training kernels compiled into this same object ────────────────
+ * (see build/cuda_build.bat — separate nvcc objects emit duplicate CRT
+ * math stubs that crash at load) */
+#include "wubu_train_cuda.cu"

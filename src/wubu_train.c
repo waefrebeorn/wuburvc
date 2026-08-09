@@ -970,9 +970,34 @@ static void decoder_backward(WuBuRVCModel *model, const DecCache *cache,
 int wubu_decoder_forward(WuBuRVCModel *model, const float *mel_in, int n_frames,
                          float *audio, int max_samples) {
     DecCache cache;
+    memset(&cache, 0, sizeof(cache)); /* decoder_forward may return -1 before initializing */
     int n = decoder_forward(model, mel_in, n_frames, audio, max_samples, &cache);
     decoder_cache_free(&cache);
     return n;
+}
+
+/* Public wrapper around the static decoder_backward (Triple-DA A/B for the
+ * CUDA training backend). Returns sample count or -1. */
+int wubu_train_backward_cpu(WuBuRVCModel *model, const float *mel_in, int n_frames,
+                            const float *wav, int n_samples,
+                            WuBuTrainRegistry *reg) {
+    if (!model || !mel_in || !wav || !reg) return -1;
+    int max_samples = n_frames * 400;
+    float *audio = (float *)malloc((size_t)max_samples * sizeof(float));
+    if (!audio) return -1;
+    DecCache cache;
+    memset(&cache, 0, sizeof(cache));
+    int n_out = decoder_forward(model, mel_in, n_frames, audio, max_samples, &cache);
+    if (n_out <= 0) { free(audio); decoder_cache_free(&cache); return -1; }
+    int n = n_out < n_samples ? n_out : n_samples;
+    float *d_audio = (float *)malloc((size_t)n_out * sizeof(float));
+    if (!d_audio) { free(audio); decoder_cache_free(&cache); return -1; }
+    for (int i = 0; i < n; i++) d_audio[i] = 2.0f * (audio[i] - wav[i]) / (float)n;
+    for (int i = n; i < n_out; i++) d_audio[i] = 0.0f;
+    wubu_train_registry_zero_grads(reg);
+    decoder_backward(model, &cache, mel_in, d_audio, reg, NULL);
+    free(d_audio); free(audio); decoder_cache_free(&cache);
+    return n_out;
 }
 
 int wubu_train_step(WuBuRVCModel *model, WuBuTrainRegistry *reg, WuBuAdamW *opt,

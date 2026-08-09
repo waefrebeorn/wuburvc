@@ -25,6 +25,7 @@
 #include <string.h>
 #include <math.h>
 #include <stdio.h>
+#include <omp.h>
 
 /* QUALITY-SAFE vectorization contract: the AVX2 conv paths must keep
  * mul+add (two roundings, scalar order) so output is byte-identical to the
@@ -452,11 +453,14 @@ int wubu_rmvpe_f0(WuBuRmvpe *r, const float *pcm, int n_samples,
     const int n_mels = 128;
     int T = wubu_stft_n_frames(r->stft, n_samples);
     if (T < 1) return -1;
+    double t_dbg0 = getenv("WUBU_TIME_STAGES") ? omp_get_wtime() : 0.0;
+    double t_dbg_stft = 0.0, t_dbg_enc = 0.0, t_dbg_gru = 0.0, t_dbg_head = 0.0;
 
     float *mag = (float *)malloc((size_t)n_bins * T * sizeof(float));
     float *mel = (float *)malloc((size_t)n_mels * T * sizeof(float));
     if (!mag || !mel) { free(mag); free(mel); return -1; }
     wubu_stft_magnitude(r->stft, pcm, n_samples, mag, T);
+    if (getenv("WUBU_TIME_STAGES")) t_dbg_stft = omp_get_wtime();
     wubu_mel_apply(r->mel_basis, n_mels, n_bins, mag, T, mel);
     free(mag);
     /* log(clamp(mel, 1e-5)) */
@@ -648,6 +652,7 @@ int wubu_rmvpe_f0(WuBuRmvpe *r, const float *pcm, int n_samples,
         float *gru_out = (float *)malloc((size_t)H * 512 * sizeof(float));
         if (!gru_out) { free(feat); return -1; }
         if (wubu_gru_forward(r->gru, feat, H, gru_out) != 0) { free(feat); free(gru_out); return -1; }
+        if (getenv("WUBU_TIME_STAGES")) t_dbg_gru = omp_get_wtime();
         free(feat);
         if (getenv("WUBU_RMVPE_DUMP")) {
             float mf = 0, mf2 = 0;
@@ -692,6 +697,15 @@ int wubu_rmvpe_f0(WuBuRmvpe *r, const float *pcm, int n_samples,
         }
 
         /* decode first T frames -> f0 */
+        if (getenv("WUBU_TIME_STAGES")) {
+            t_dbg_head = omp_get_wtime();
+            fprintf(stderr, "[rmvpe-time] stft+mel=%.2fs enc=%.2fs gru=%.2fs head+decode=%.2fs total=%.2fs\n",
+                    t_dbg_stft - t_dbg0,
+                    (t_dbg_gru ? t_dbg_gru : t_dbg_head) - t_dbg_stft,
+                    t_dbg_gru ? (t_dbg_head - t_dbg_gru) : 0.0,
+                    omp_get_wtime() - (t_dbg_gru ? t_dbg_gru : t_dbg_head),
+                    omp_get_wtime() - t_dbg0);
+        }
         for (int t = 0; t < T && t < max_frames; t++)
             f0_out[t] = decode_row(gru_out + (size_t)t * 360, r->cents);
         if (getenv("WUBU_RMVPE_DUMP")) {

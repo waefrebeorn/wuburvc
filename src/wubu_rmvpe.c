@@ -20,6 +20,7 @@
 #include "wubu_stft.h"
 #include "wubu_gru.h"
 #include "wubu_math.h"
+#include <immintrin.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -131,18 +132,87 @@ void wubu_rmvpe_free(WuBuRmvpe *r) {
     free(r);
 }
 
-/* ── 2D conv helpers (stride 1, optional pad) ── */
+/* ── 2D conv helpers (stride 1, optional pad) ──
+ * AVX2 W-vectorized: the mel-bin width W is the contiguous dim, so 8 wi's
+ * are computed per vector with input loads shared across (ic,dh,dw) taps.
+ * Scalar fallback kept for k != 3 / non-AVX2. Measured 2026-08-09: RMVPE's
+ * scalar 2D convs were 9.2s of 38.8s wall (24%!) — the engine's 1D conv got
+ * the SIMD rewrite, RMVPE never did. This cuts the U-Net conv time. */
 static void conv2d(const float *in, int cin, int H, int W,
                    const float *w, const float *b, int cout, int k, int pad,
                    float *out) {
     memset(out, 0, (size_t)cout * H * W * sizeof(float));
-    /* parallel over output channels — the U-Net convs dominate RMVPE time
-     * on long audio (serial = minutes on a 45s vocal) */
+    /* parallel over output channels — the U-Net convs dominate RMVPE time */
 #pragma omp parallel for schedule(static) if(cout >= 4)
     for (int oc = 0; oc < cout; oc++) {
         const float *wrow = w + (size_t)oc * cin * k * k;
         float bias = b ? b[oc] : 0.0f;
         for (int h = 0; h < H; h++) {
+#if defined(__AVX2__) && defined(__FMA__)
+            /* FMA rounds once vs scalar mul+add twice → ~1ulp f0 difference.
+             * Quality mode MUST stay byte-identical, so the AVX2 path is
+             * speed-mode only (fast math switch); scalar runs in quality. */
+            if (k == 3 && pad == 1 && wubu_get_fast_math()) {
+                /* left boundary wi=0 (tap -1 invalid) */
+                if (W > 0) {
+                    float acc = bias;
+                    for (int ic = 0; ic < cin; ic++) {
+                        const float *wch = wrow + (size_t)ic * k * k;
+                        for (int dh = 0; dh < k; dh++) {
+                            int hh = h + dh - pad;
+                            if (hh < 0 || hh >= H) continue;
+                            for (int dw = 0; dw < k; dw++) {
+                                int ww = dw - pad;
+                                if (ww < 0 || ww >= W) continue;
+                                acc += in[(size_t)ic * H * W + (size_t)hh * W + ww] *
+                                       wch[(size_t)dh * k + dw];
+                            }
+                        }
+                    }
+                    out[(size_t)oc * H * W + (size_t)h * W + 0] = acc;
+                }
+                /* interior: wi in [1, W-2] all taps valid; 8 wi's per vector.
+                 * Vector covers wi..wi+7 with loads at wi-1..wi+9. */
+                int wi = 1;
+                int wi_vec_end = W - 9;   /* vector at wi loads taps wi-1..wi+8; need wi+8 <= W-1 */
+                for (; wi <= wi_vec_end; wi += 8) {
+                    __m256 accv = _mm256_set1_ps(bias);
+                    for (int ic = 0; ic < cin; ic++) {
+                        const float *wch = wrow + (size_t)ic * k * k;
+                        for (int dh = 0; dh < k; dh++) {
+                            int hh = h + dh - pad;
+                            if (hh < 0 || hh >= H) continue;
+                            const float *inrow = in + (size_t)ic * H * W + (size_t)hh * W + wi - pad;
+                            for (int dw = 0; dw < k; dw++) {
+                                __m256 iv = _mm256_loadu_ps(inrow + dw);
+                                __m256 wv = _mm256_set1_ps(wch[(size_t)dh * k + dw]);
+                                accv = _mm256_fmadd_ps(iv, wv, accv);
+                            }
+                        }
+                    }
+                    _mm256_storeu_ps(out + (size_t)oc * H * W + (size_t)h * W + wi, accv);
+                }
+                /* right tail: wi in [wi, W-1] (tap +1 may hit W) */
+                for (; wi < W; wi++) {
+                    float acc = bias;
+                    for (int ic = 0; ic < cin; ic++) {
+                        const float *wch = wrow + (size_t)ic * k * k;
+                        for (int dh = 0; dh < k; dh++) {
+                            int hh = h + dh - pad;
+                            if (hh < 0 || hh >= H) continue;
+                            for (int dw = 0; dw < k; dw++) {
+                                int ww = wi + dw - pad;
+                                if (ww < 0 || ww >= W) continue;
+                                acc += in[(size_t)ic * H * W + (size_t)hh * W + ww] *
+                                       wch[(size_t)dh * k + dw];
+                            }
+                        }
+                    }
+                    out[(size_t)oc * H * W + (size_t)h * W + wi] = acc;
+                }
+                continue;
+            }
+#endif
             for (int wi = 0; wi < W; wi++) {
                 float acc = bias;
                 for (int ic = 0; ic < cin; ic++) {

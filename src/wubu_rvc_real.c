@@ -265,6 +265,263 @@ void conv1d_c(const float *in, int in_ch, int n,
     }
 }
 
+/* Conv1d with fused input activation + fused in-place residual add.
+ * Faithful specialization of conv1d_c (same accumulation order, bit-exact):
+ *   in_slope > 0  → apply lrelu(x, in_slope) to INPUT samples as loaded
+ *   resid != NULL → skip memset; at store, ADD the old out[] (the residual)
+ *                    to the accumulated result before writing back
+ * Used by the MRF: x' = conv2(lrelu(conv1(lrelu(x)))) + x collapses the old
+ * 7-pass sequence (2 memcpy + 2 lrelu + 1 add + 2 convs) into 2 fused calls
+ * with zero intermediate sweeps. Accumulation order per output element is
+ * identical to conv1d_c, so parity holds exactly.
+ * NOTE: resid==out is legal (in-place): out is only written at the final
+ * store, so reading out[j] there yields the untouched residual. */
+static void conv1d_c_fused_impl(const float *in, int in_ch, int n,
+                           const float *w, const float *b,
+                           int out_ch, int k, int stride, int pad, int dil,
+                           float *out, float in_slope, const float *resid) {
+    int n_out = (n + 2 * pad - dil * (k - 1) - 1) / stride + 1;
+    if (n_out <= 0) return;
+    if (!resid) memset(out, 0, (size_t)out_ch * n_out * sizeof(float));
+    if (out_ch >= 32) {
+        /* INPUT-STATIONARY tiled conv (same structure as conv1d_c). */
+        const int TILE = 8192;
+#pragma omp parallel for schedule(dynamic, 4) num_threads(omp_in_parallel() ? 4 : 12) if(n_out >= TILE)
+        for (int jb = 0; jb < n_out; jb += TILE) {
+            int j_hi = jb + TILE < n_out ? jb + TILE : n_out;
+#if defined(__AVX2__) && defined(__FMA__)
+            if (stride == 1 && in_ch >= 8 && k >= 1) {
+                /* REGISTER-ACCUMULATED AVX2, OC-BLOCKED (see conv1d_c). */
+                    enum { OC_BLK = 4 };
+                    int j_in_lo = jb < pad ? pad : jb;
+                    int j_in_hi = n - (k - 1) * dil + pad;
+                    if (j_in_hi > j_hi) j_in_hi = j_hi;
+                    int jr_max = n - 32 - (k - 1) * dil + pad;
+                    if (jr_max > j_in_hi - 32) jr_max = j_in_hi - 32;
+                    for (int oc0 = 0; oc0 < out_ch; oc0 += OC_BLK) {
+                        int n_oc = OC_BLK;
+                        if (oc0 + n_oc > out_ch) n_oc = out_ch - oc0;
+                        float *orow0[OC_BLK];
+                        const float *wv0[OC_BLK];
+                        float bias0[OC_BLK];
+                        for (int oc = 0; oc < n_oc; oc++) {
+                            orow0[oc] = out + (size_t)(oc0 + oc) * n_out;
+                            wv0[oc] = w + (size_t)(oc0 + oc) * in_ch * k;
+                            bias0[oc] = b ? b[oc0 + oc] : 0.0f;
+                            if (!resid)
+                                for (int j = jb; j < j_hi; j++) orow0[oc][j] += bias0[oc];
+                        }
+                        /* left boundary: full (ic,tap) sum, bounds-checked */
+                        for (int j = jb; j < j_in_lo && j < j_hi; j++)
+                            for (int oc = 0; oc < n_oc; oc++) {
+                                const float *wv = wv0[oc];
+                                float acc = resid ? bias0[oc] : orow0[oc][j];
+                                for (int ick = 0; ick < in_ch; ick++) {
+                                    const float *ir2 = in + (size_t)ick * n;
+                                    const float *wv2 = wv + (size_t)ick * k;
+                                    for (int tap = 0; tap < k; tap++) {
+                                        int src = j + tap * dil - pad;
+                                        if (src >= 0 && src < n) {
+                                            float iv = ir2[src];
+                                            if (in_slope > 0.0f && iv < 0.0f) iv *= in_slope;
+                                            acc += iv * wv2[tap];
+                                        }
+                                    }
+                                }
+                                if (resid) acc += orow0[oc][j];
+                                orow0[oc][j] = acc;
+                            }
+                        /* interior: all taps valid; register-blocked, 4-oc shared input */
+                        int jr = j_in_lo;
+                        for (; jr <= jr_max; jr += 32) {
+                            __m256 a0[OC_BLK], a1[OC_BLK], a2[OC_BLK], a3[OC_BLK];
+                            for (int oc = 0; oc < n_oc; oc++) {
+                                __m256 bb = _mm256_set1_ps(bias0[oc]);
+                                a0[oc] = bb;
+                                a1[oc] = bb;
+                                a2[oc] = bb;
+                                a3[oc] = bb;
+                            }
+                            for (int ick = 0; ick < in_ch; ick++) {
+                                const float *ir2 = in + (size_t)ick * n + jr - pad;
+                                for (int tap = 0; tap < k; tap++) {
+                                    __m256 iv0 = _mm256_loadu_ps(ir2 + tap * dil);
+                                    __m256 iv1 = _mm256_loadu_ps(ir2 + 8 + tap * dil);
+                                    __m256 iv2 = _mm256_loadu_ps(ir2 + 16 + tap * dil);
+                                    __m256 iv3 = _mm256_loadu_ps(ir2 + 24 + tap * dil);
+                                    if (in_slope > 0.0f) {
+                                        __m256 sl = _mm256_set1_ps(in_slope);
+                                        __m256 z = _mm256_setzero_ps();
+                                        iv0 = _mm256_blendv_ps(_mm256_mul_ps(iv0, sl), iv0,
+                                                               _mm256_cmp_ps(iv0, z, _CMP_GT_OQ));
+                                        iv1 = _mm256_blendv_ps(_mm256_mul_ps(iv1, sl), iv1,
+                                                               _mm256_cmp_ps(iv1, z, _CMP_GT_OQ));
+                                        iv2 = _mm256_blendv_ps(_mm256_mul_ps(iv2, sl), iv2,
+                                                               _mm256_cmp_ps(iv2, z, _CMP_GT_OQ));
+                                        iv3 = _mm256_blendv_ps(_mm256_mul_ps(iv3, sl), iv3,
+                                                               _mm256_cmp_ps(iv3, z, _CMP_GT_OQ));
+                                    }
+                                    for (int oc = 0; oc < n_oc; oc++) {
+                                        float wt = wv0[oc][(size_t)ick * k + tap];
+                                        __m256 wv8 = _mm256_set1_ps(wt);
+                                        a0[oc] = _mm256_fmadd_ps(iv0, wv8, a0[oc]);
+                                        a1[oc] = _mm256_fmadd_ps(iv1, wv8, a1[oc]);
+                                        a2[oc] = _mm256_fmadd_ps(iv2, wv8, a2[oc]);
+                                        a3[oc] = _mm256_fmadd_ps(iv3, wv8, a3[oc]);
+                                    }
+                                }
+                            }
+                            for (int oc = 0; oc < n_oc; oc++) {
+                                if (resid) {
+                                    a0[oc] = _mm256_add_ps(a0[oc], _mm256_loadu_ps(orow0[oc] + jr));
+                                    a1[oc] = _mm256_add_ps(a1[oc], _mm256_loadu_ps(orow0[oc] + jr + 8));
+                                    a2[oc] = _mm256_add_ps(a2[oc], _mm256_loadu_ps(orow0[oc] + jr + 16));
+                                    a3[oc] = _mm256_add_ps(a3[oc], _mm256_loadu_ps(orow0[oc] + jr + 24));
+                                }
+                                _mm256_storeu_ps(orow0[oc] + jr, a0[oc]);
+                                _mm256_storeu_ps(orow0[oc] + jr + 8, a1[oc]);
+                                _mm256_storeu_ps(orow0[oc] + jr + 16, a2[oc]);
+                                _mm256_storeu_ps(orow0[oc] + jr + 24, a3[oc]);
+                            }
+                        }
+                        /* 8-wide tail: per-oc */
+                        for (; jr + 8 <= j_in_hi && jr + 7 + (k - 1) * dil - pad < n; jr += 8)
+                            for (int oc = 0; oc < n_oc; oc++) {
+                                const float *wv = wv0[oc];
+                                __m256 a0 = _mm256_set1_ps(bias0[oc]);
+                                for (int ick = 0; ick < in_ch; ick++) {
+                                    const float *ir2 = in + (size_t)ick * n + jr - pad;
+                                    const float *wv2 = wv + (size_t)ick * k;
+                                    for (int tap = 0; tap < k; tap++) {
+                                        __m256 iv = _mm256_loadu_ps(ir2 + tap * dil);
+                                        if (in_slope > 0.0f) {
+                                            __m256 sl = _mm256_set1_ps(in_slope);
+                                            __m256 z = _mm256_setzero_ps();
+                                            iv = _mm256_blendv_ps(_mm256_mul_ps(iv, sl), iv,
+                                                                  _mm256_cmp_ps(iv, z, _CMP_GT_OQ));
+                                        }
+                                        a0 = _mm256_fmadd_ps(iv, _mm256_set1_ps(wv2[tap]), a0);
+                                    }
+                                }
+                                if (resid) a0 = _mm256_add_ps(a0, _mm256_loadu_ps(orow0[oc] + jr));
+                                _mm256_storeu_ps(orow0[oc] + jr, a0);
+                            }
+                        /* right boundary + tail (full sum, bounds-checked) */
+                        for (; jr < j_hi; jr++)
+                            for (int oc = 0; oc < n_oc; oc++) {
+                                const float *wv = wv0[oc];
+                                float acc = resid ? bias0[oc] : orow0[oc][jr];
+                                for (int ick = 0; ick < in_ch; ick++) {
+                                    const float *ir2 = in + (size_t)ick * n;
+                                    const float *wv2 = wv + (size_t)ick * k;
+                                    for (int tap = 0; tap < k; tap++) {
+                                        int src = jr + tap * dil - pad;
+                                        if (src >= 0 && src < n) {
+                                            float iv = ir2[src];
+                                            if (in_slope > 0.0f && iv < 0.0f) iv *= in_slope;
+                                            acc += iv * wv2[tap];
+                                        }
+                                    }
+                                }
+                                if (resid) acc += orow0[oc][jr];
+                                orow0[oc][jr] = acc;
+                            }
+                    }
+                    continue; /* full (ic,tap) done — skip the per-tap loops */
+                }
+#endif
+            for (int oc = 0; oc < out_ch; oc++) {
+                float *orow = out + (size_t)oc * n_out;
+                float bias = b ? b[oc] : 0.0f;
+                const float *wv = w + (size_t)oc * in_ch * k;
+                if (!resid)
+                    for (int j = jb; j < j_hi; j++) orow[j] += bias;
+                if (resid) {
+                    /* (bias + sum) + old — same association as the AVX2 path */
+                    for (int j = jb; j < j_hi; j++) {
+                        float acc = bias;
+                        for (int ic = 0; ic < in_ch; ic++) {
+                            const float *irow = in + (size_t)ic * n;
+                            for (int tap = 0; tap < k; tap++) {
+                                int src = j * stride + tap * dil - pad;
+                                if (src >= 0 && src < n) {
+                                    float iv = irow[src];
+                                    if (in_slope > 0.0f && iv < 0.0f) iv *= in_slope;
+                                    acc += iv * wv[(size_t)ic * k + tap];
+                                }
+                            }
+                        }
+                        orow[j] = acc + orow[j];
+                    }
+                } else {
+                    for (int ic = 0; ic < in_ch; ic++) {
+                        const float *irow = in + (size_t)ic * n;
+                        for (int tap = 0; tap < k; tap++) {
+                            int off = tap * dil - pad;
+                            float wt = wv[(size_t)ic * k + tap];
+                            int j_lo = jb, j_hi2 = j_hi;
+                            if (stride == 1) {
+                                if (off < 0) j_lo = -off;
+                                if (n - off < j_hi2) j_hi2 = n - off;
+                            } else {
+                                if (off < 0) j_lo = (-off + stride - 1) / stride;
+                                if (n - off < 0) j_hi2 = 0;
+                                else if ((n - off + stride - 1) / stride < j_hi2)
+                                    j_hi2 = (n - off + stride - 1) / stride;
+                            }
+                            if (j_lo < jb) j_lo = jb;
+                            if (j_lo < j_hi2) {
+                                for (int j = j_lo; j < j_hi2; j++) {
+                                    float iv = irow[j * stride + off];
+                                    if (in_slope > 0.0f && iv < 0.0f) iv *= in_slope;
+                                    orow[j] += iv * wt;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        /* few output channels: parallelize over the SEQUENCE (see conv1d_c) */
+        for (int oc = 0; oc < out_ch; oc++) {
+            float *orow = out + (size_t)oc * n_out;
+            float bias = b ? b[oc] : 0.0f;
+            const float *wv = w ? w + (size_t)oc * in_ch * k : NULL;
+            if (!wv) {
+                for (int j = 0; j < n_out; j++) orow[j] = bias + (resid ? orow[j] : 0.0f);
+                continue;
+            }
+#pragma omp parallel for schedule(dynamic, 64) if(n_out >= 4096)
+            for (int j = 0; j < n_out; j++) {
+                float acc = bias;
+                for (int ic = 0; ic < in_ch; ic++) {
+                    const float *irow = in + (size_t)ic * n;
+                    const float *wrow = wv + (size_t)ic * k;
+                    for (int tap = 0; tap < k; tap++) {
+                        int src = j * stride + tap * dil - pad;
+                        if (src >= 0 && src < n) {
+                            float iv = irow[src];
+                            if (in_slope > 0.0f && iv < 0.0f) iv *= in_slope;
+                            acc += iv * wrow[tap];
+                        }
+                    }
+                }
+                orow[j] = acc + (resid ? orow[j] : 0.0f);
+            }
+        }
+    }
+}
+
+/* Public wrapper — the MRF + parity tests link against this. */
+void conv1d_c_fused(const float *in, int in_ch, int n,
+                    const float *w, const float *b,
+                    int out_ch, int k, int stride, int pad, int dil,
+                    float *out, float in_slope, const float *resid) {
+    conv1d_c_fused_impl(in, in_ch, n, w, b, out_ch, k, stride, pad, dil,
+                        out, in_slope, resid);
+}
+
 /* ConvTranspose1d, PyTorch weight (in_ch, out_ch, k). out: (n-1)*s - 2p + k
  * POLYPHASE: per output phase p in [0, stride), only taps
  * tap = (p+pad) % stride + m*stride contribute, and their input index
@@ -1308,30 +1565,30 @@ int wubu_generator_nsf(WuBuRVCModel *model,
                         const float *d2 = r2v->data;
                         float *tmp = pool_tmp + (size_t)s * ch * next_n;
                         {
-                            /* x = leaky(x); conv1; leaky; conv2; + residual */
-                            memcpy(tmp, rb_in, (size_t)ch * next_n * sizeof(float));
-                            if (use_snake) snake_lrelu_c(tmp, (size_t)ch * next_n, 0.1f);
-                            else lrelu_c(tmp, (size_t)ch * next_n, 0.1f);
-                            conv1d_c(tmp, ch, next_n, d1, r1b && r1b->data ? r1b->data : NULL,
-                                     ch, k, 1, pad1, dil, rb_out);
-                            if (use_snake) snake_lrelu_c(rb_out, (size_t)ch * next_n, 0.1f);
-                            else lrelu_c(rb_out, (size_t)ch * next_n, 0.1f);
-                            conv1d_c(rb_out, ch, next_n, d2, r2b && r2b->data ? r2b->data : NULL,
-                                     ch, k, 1, pad2, 1, tmp);
-#if defined(__AVX2__)
-                            {
-                                size_t vi = 0, vn = (size_t)ch * next_n;
-                                for (; vi + 8 <= vn; vi += 8) {
-                                    __m256 a = _mm256_loadu_ps(tmp + vi);
-                                    __m256 b = _mm256_loadu_ps(rb_in + vi);
-                                    _mm256_storeu_ps(tmp + vi, _mm256_add_ps(a, b));
-                                }
-                                for (; vi < vn; vi++) tmp[vi] += rb_in[vi];
+                            if (use_snake) {
+                                /* Snake can't fuse into the conv input load —
+                                 * keep the original 7-pass sequence. */
+                                memcpy(tmp, rb_in, (size_t)ch * next_n * sizeof(float));
+                                snake_lrelu_c(tmp, (size_t)ch * next_n, 0.1f);
+                                conv1d_c(tmp, ch, next_n, d1, r1b && r1b->data ? r1b->data : NULL,
+                                         ch, k, 1, pad1, dil, rb_out);
+                                snake_lrelu_c(rb_out, (size_t)ch * next_n, 0.1f);
+                                conv1d_c(rb_out, ch, next_n, d2, r2b && r2b->data ? r2b->data : NULL,
+                                         ch, k, 1, pad2, 1, tmp);
+                                for (int i = 0; i < ch * next_n; i++) tmp[i] += rb_in[i];
+                                memcpy(rb_in, tmp, (size_t)ch * next_n * sizeof(float));
+                            } else {
+                                /* x = conv2(lrelu(conv1(lrelu(x)))) + x fused into
+                                 * TWO conv calls: lrelu on the input load, residual
+                                 * added in-place at store. Zero intermediate
+                                 * sweeps (was: 2 memcpy + 2 lrelu + 1 add). */
+                                conv1d_c_fused(rb_in, ch, next_n,
+                                               d1, r1b && r1b->data ? r1b->data : NULL,
+                                               ch, k, 1, pad1, dil, rb_out, 0.1f, NULL);
+                                conv1d_c_fused(rb_out, ch, next_n,
+                                               d2, r2b && r2b->data ? r2b->data : NULL,
+                                               ch, k, 1, pad2, 1, rb_in, 0.1f, rb_in);
                             }
-#else
-                            for (int i = 0; i < ch * next_n; i++) tmp[i] += rb_in[i];
-#endif
-                            memcpy(rb_in, tmp, (size_t)ch * next_n * sizeof(float));
                         }
                     }
 #if defined(__AVX2__)

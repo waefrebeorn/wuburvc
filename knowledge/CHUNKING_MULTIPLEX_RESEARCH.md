@@ -190,16 +190,61 @@ bottleneck. Document now, implement after C1.
 
 ---
 
+## ✅ Session results (2026-08-08) — what got built and measured
+
+### Implemented
+1. **`--ctx` and `--xfade` flags** (wubu_rvc_cli.c): HuBERT context window +
+   crossfade are now CLI-tunable (0.72 s reference default, 0.40 s speed mode).
+2. **Fused MRF conv** (real.c `conv1d_c_fused`): the per-pair sequence
+   `x' = conv2(lrelu(conv1(lrelu(x)))) + x` collapsed from 7 buffer passes
+   (2 memcpy + 2 lrelu + 1 add + 2 convs) to **2 fused conv calls** with
+   lrelu fused into the input load and the residual added in-place at the
+   store. **Bit-exact**: t_fused_ab (n=798/120000/12345, pairs 3/5/9)
+   maxdiff 0.000000000; the full pipeline produces a **byte-identical WAV**
+   (16-bit, max sample diff 0) vs the unfused build. Pure speed, zero quality
+   change.
+3. **Sweep tooling** (tools/sweep_chunk.sh + tools/quality_gate.py).
+
+### Sweep (22.5 s track, jobs=4 unless noted, xfade 0.1)
+| config | chunks | synth | RT | mel-corr vs base | seam-corr | rmsR |
+|---|---|---|---|---|---|---|
+| base 3s/0.72 (ref) | 8 | 26.62 s | 1.18x | 1.0000 | 1.0000 | 1.000 |
+| **3s/0.40** | 8 | **23.68 s** | 1.05x | **0.9632** | **0.7374** | 0.979 |
+| 3s/0.30 | 8 | 24.02 s | 1.07x | 0.9600 | 0.7379 | 0.999 |
+| 3s/0.50 | 8 | 25.25 s | 1.12x | 0.9635 | 0.7259 | 0.970 |
+| 4.5s/0.40 | 6 | 29.37 s | 1.31x | 0.9198 | 0.1171 | 0.980 |
+| 6s/0.30 | 4 | 22.64 s | **1.01x** | 0.9243 | 0.2375 | 0.955 |
+| 6s/0.40 | 4 | 24.82 s | 1.10x | 0.9273 | 0.2805 | 0.952 |
+| 9s/0.40 | 3 | 27.17 s | 1.21x | 0.9074 | 0.0879 | 0.937 |
+| 3s/0.40 jobs=6 | 8 | 29.21 s | 1.30x | 0.9633 | 0.7333 | 0.977 |
+| 6s/0.40 jobs=6 | 4 | 30.67 s | 1.36x | 0.9273 | 0.2805 | 0.952 |
+
+**Reads**: the quality gate (mel/seam/rms vs the 0.72 reference) is monotonic —
+small chunks + full context = reference quality; big chunks lose mel (0.92)
+and seam (0.09-0.28) correlation. The boss's "best quality" priority → keep
+the 0.72 default, expose 0.40 as the speed mode. 6s/0.30 is the speed king
+(1.01x) but at a real spectral cost. jobs=6 always loses (oversubscription).
+
+### Timing breakdown (generator stages, WUBU_TIME_STAGES)
+- jobs=1: mrf 4.66 → **4.21 s/chunk** (fused, −10%), convT 0.65 s, total
+  5.46 → 5.01 s.
+- jobs=4: per-chunk mrf ~6 s (both builds) — the 4× oversubscription
+  (4 workers × 3 stacks × 4 conv threads = 48 threads on 12 cores) eats the
+  kernel win. Fix order: C1 (stack-batched conv kills the ×3 stacks) then C2
+  (pinning), then the two-pass pipeline (A4).
+
 ## Recommended execution order (value / effort)
-1. **`--ctx` flag + default 0.4 s** (A2): ~10 % pipeline, 1-line change + A/B. ✅ cheap
-2. **MRF stack-multiplexed conv** (C1): input traffic ÷3 on the dominant
-   stage. Medium; parity-gated. **THE win.**
-3. **--chunk sweep 3/4.5/6/9 + xfade 0.25** (A3): pick the real optimum on the
+1. ✅ `--ctx`/`--xfade` flags + sweep + quality gate (done this session).
+2. ✅ **Fused MRF conv** (done — byte-identical, −10% generator at jobs=1).
+3. **MRF stack-multiplexed conv** (C1): input traffic ÷3 on the dominant
+   stage. Parity-gated. **THE remaining win** — also kills the nested-OMP
+   oversubscription that hides the fused win at jobs=4.
+4. **--chunk sweep 3/4.5/6/9 + xfade 0.25** (A3): pick the real optimum on the
    boss's 45 s track; also fixes the 28 % overhead. Cheap.
-4. **Worker pinning OMP_PROC_BIND=close** (C2): free win if L3-resident; test.
-5. **Two-pass pipeline** (A4): kills the nested-OMP oversubscription entirely.
+5. **Worker pinning OMP_PROC_BIND=close** (C2): free win if L3-resident; test.
+6. **Two-pass pipeline** (A4): kills the nested-OMP oversubscription entirely.
    Medium; big architectural cleanliness win.
-6. **Batched HuBERT** (C5): after C1 changes the bottleneck. Later.
+7. **Batched HuBERT** (C5): after C1 changes the bottleneck. Later.
 
 ## Sources
 - arXiv 2505.22487 (Effective Context in Neural Speech Models) — HuBERT 400 ms streaming, 0.6-1.5 % degradation

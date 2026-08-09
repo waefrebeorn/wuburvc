@@ -256,7 +256,11 @@ int main(int argc, char **argv) {
                 "         --snake       : use Snake activation (BigVGAN: x + (1/a)sin^2(a*x))\n"
                 "         --formant R   : formant shift ratio (1.0=none, <1=male, >1=female)\n"
                 "         --f0smooth S  : F0 contour smoothing strength (0.0-1.0)\n"
-                "         --f0ref DIR   : use reference f0 (nsff0_raw.bin + f0_coarse.bin)\n",
+                "         --f0ref DIR   : use reference f0 (nsff0_raw.bin + f0_coarse.bin)\n"
+                "         --chunk F     : chunked inference window in seconds (default 3.0)\n"
+                "         --ctx F       : HuBERT context window in seconds (default 0.72; 0.40 = speed mode)\n"
+                "         --xfade F     : crossfade overlap in seconds (default 0.10)\n"
+                "         --jobs N      : parallel chunk workers (default 4)\n",
                 argv[0]);
         return 1;
     }
@@ -279,6 +283,11 @@ int main(int argc, char **argv) {
     float rms_mix = 0.25f;    /* --rmsmix F: output follows input volume envelope (RVC default 0.25) */
     int autokey_probe = 0;    /* --autokey N: auto key adaptation (N = probe secs) */
     float chunk_secs = 3.0f;  /* --chunk F: chunked inference (3s default; 0 = whole-track) */
+    float ctx_secs = 0.72f;   /* --ctx F: HuBERT context window in seconds
+                               * (0.72 default = RVC reference quality;
+                               * 0.40 = paper-backed speed mode, arXiv
+                               * 2505.22487 effective context ~400ms) */
+    float xfade_secs = 0.10f; /* --xfade F: crossfade overlap in seconds (0.10 default) */
     int jobs = 4;             /* --jobs N: parallel chunk workers (sweet spot measured) */
     int no_chunk = 0;         /* --no-chunk: force the whole-track path (parity) */
     int use_cuda = 0;         /* --cuda: run the GeneratorNSF on the GPU (CUDA) */
@@ -331,6 +340,16 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[a], "--chunk") == 0) {
             chunk_secs = (float)atof(argv[a + 1]);
             if (chunk_secs < 0.5f) chunk_secs = 0.5f;
+            a++;
+        } else if (strcmp(argv[a], "--ctx") == 0) {
+            ctx_secs = (float)atof(argv[a + 1]);
+            if (ctx_secs < 0.05f) ctx_secs = 0.05f;
+            if (ctx_secs > 2.0f) ctx_secs = 2.0f;
+            a++;
+        } else if (strcmp(argv[a], "--xfade") == 0) {
+            xfade_secs = (float)atof(argv[a + 1]);
+            if (xfade_secs < 0.01f) xfade_secs = 0.01f;
+            if (xfade_secs > 1.0f) xfade_secs = 1.0f;
             a++;
         } else if (strcmp(argv[a], "--jobs") == 0) {
             jobs = atoi(argv[a + 1]);
@@ -557,8 +576,8 @@ int main(int argc, char **argv) {
     if (use_chunk) {
         /* 6b. chunked + parallel synthesis (default) */
         const int chunk_16k = (int)(chunk_secs * 16000);
-        const int extra_16k = 11520;                 /* 0.72 s HuBERT context */
-        const int xfade_16k = (int)(0.10f * 16000);  /* 0.1 s crossfade */
+        const int extra_16k = (int)(ctx_secs * 16000);       /* HuBERT context */
+        const int xfade_16k = (int)(xfade_secs * 16000);     /* crossfade */
         const int hop_16k = chunk_16k - xfade_16k;
         if (hop_16k < 16000) die("--chunk too small");
         int n_chunks = 0;

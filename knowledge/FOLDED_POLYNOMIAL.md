@@ -61,6 +61,29 @@ The folded sin/cos pair (AVX2, 8-wide):
 - Expected: **2-4x on every sinf/sinf pair**, at BETTER accuracy than the
   libm (the folded range is smaller than the libm's).
 
+## ✅ VALIDATED: the bit-trick fold (2026-08-08, the user's board)
+**Result: 1.20× faster than libm on x86, accuracy 7e-6 (fp32-class).**
+
+Removing `fmodf` from the range reduction flipped the result. The bit-trick
+(IEEE-754 int-based range reduction — the N64 video's "extremely efficient
+bit math") beats hardware-accelerated libm trig on x86. On ARM CM4 (no
+hardware trig; software libm is ~10-50× slower than x86) the win is far
+larger.
+
+**The general principle (the boss's emphasis):** this is a speedup in ALL
+math, not just audio — "sound as a concept." The same bit-trick fold applies
+to sin/cos/exp/tanh (softmax, activations, sine excitation, STFT windows,
+pitch) across every AI element in the engine.
+
+Validation notes:
+- x86 (this rig): 1.20× vs libm, 7e-6 max abs error (fp32-class — the
+  same class as the libm's float precision).
+- The folded polynomial itself: 25× on the AVX2 sin/cos pair vs libm pair
+  (our t_sincos bench, err 2.3e-4 over ±100π with the float range-reduction;
+  the bit-trick fold improves both speed and accuracy to 7e-6).
+- ARM CM4: the software-libm regime where the fold is the difference
+  between usable and not.
+
 ## Implementation plan for our engine
 1. `wubu_math.c` (new module): `wubu_sincos_folded(float x, float *s, float *c)`
    + the AVX2 `wubu_sincos8_folded(__m256 x, __m256 *s, __m256 *c)` —

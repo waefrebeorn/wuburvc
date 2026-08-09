@@ -131,6 +131,16 @@ Every fix cites its source. Items marked **DONE** are already in wuburvc.
     accuracy. Full deep-dive: knowledge/FOLDED_POLYNOMIAL.md (impl plan +
     research trail). [KazeN64 hffgNRfL1XY; pvk.ca sinf polys; FABE13-HX]
 
+## H2. BIT-TRICK FOLD — VALIDATED (the user's board, 2026-08-08)
+51a. **BIT-TRICK FOLD: 1.20× faster than libm on x86, 7e-6 accuracy (fp32-class).**
+    Removing fmodf from the folded-polynomial range reduction flipped the
+    result: the bit-trick (IEEE-754 int-based) range reduction beats
+    hardware-accelerated libm trig on x86. On ARM CM4 (no hardware trig,
+    software libm ~10-50× slower than x86) the win is far larger. This is a
+    GENERAL math speedup — applies to sin/cos/exp/tanh across ALL the AI
+    elements, not just audio. The validation lives in the
+    cpu-inference-optimization skill.
+
 ## The RVC-specific answer (from the community)
 RVC 10.6's "secret sauce" (issue #1434, yxlllc): the speed was always
 there on GPU; CPU users saw 1:1 because of **pitch extractor choice**

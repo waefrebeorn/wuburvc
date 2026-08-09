@@ -50,13 +50,32 @@ flat. The chunked path needs the config retuned (see next).
 
 ## What's left (the path to <1.0x)
 1. **OC-blocked register conv** (4 output channels share each input load):
-   input traffic ÷4. First attempt was WRONG (parity failed) — the a0[OC_BLK]
-   array indexing needs the register math re-checked; expected 2-4x on convs.
+   input traffic ÷4. **DONE 2026-08-08**: bit-exact at n=798 + n=120000
+   (maxdiff 0.000000); L3 conv 26-56ms → 4.0ms. The structural rule that made
+   it pass: the OC-block must sit at the JB-TILE level (OUTSIDE the per-oc
+   loop) with a `continue` — inside the oc-loop it re-runs per channel and
+   double-counts ~in_ch×.
 2. **Chunk-worker × nested config**: jobs=4 × stack-parallel oversubscribes;
    try conv num_threads(1) inside nested (12 stacks × serial convs = 12) or a
-   per-worker omp thread budget.
-3. MRF buffer reuse: rb_in/rb_out/tmp are malloc'd+memcpy'd per (stack,pair) —
-   hoist to per-layer scratch, fuse lrelu into conv epilogue.
+   per-worker omp thread budget. Measured 2026-08-08: OMP_THREAD_LIMIT
+   8/6/4 all flat (~32s) — the convs are memory-bound, threads aren't the
+   lever anymore.
+3. MRF buffer reuse: **DONE 2026-08-08** — pooled per-layer 3-slab arena
+   (rb_in/rb_out/tmp per stack) instead of 216 malloc/free per chunk.
+4. **Folded polynomial sin/cos — DONE 2026-08-08** (wubu_math.c): AVX2 pair
+   25× vs libm, bit-trick fold 1.20× vs libm at 7e-6; wired into the NSF
+   sine + snake; fast exp + fast tanh wired into the softmax + sine.
+5. **convT polyphase**: the upsample's transposed conv is now 25% of the
+   generator (1.2s/chunk) — polyphase decomposition (per-phase sub-convs) is
+   the documented next lever.
+6. Winograd F(2,3) for the k=3 MRF convs (the register conv already captures
+   most of the win — Winograd's added mult-reduction is smaller now).
+7. INT8 per-channel on the MRF (W8A8 ~1.4-2.4x).
+
+## 2026-08-08 session result
+45s synth: 44.9s → 28.3s (2.00x → 1.26x realtime) — register conv (160x
+kernel) + OC-blocking (input /4) + folded-poly/fast-math + pooling + AVX2
+elementwise. Parity: mel-corr 0.9953, rms/peak identical.
 
 ## Honest answer to "what is the impossible"
 Full RVC (HuBERT+RMVPE+generator) faster than realtime on a 6-core consumer

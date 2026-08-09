@@ -259,6 +259,8 @@ int main(int argc, char **argv) {
                 "         --f0ref DIR   : use reference f0 (nsff0_raw.bin + f0_coarse.bin)\n"
                 "         --chunk F     : chunked inference window in seconds (default 3.0)\n"
                 "         --ctx F       : HuBERT context window in seconds (default 0.72; 0.40 = speed mode)\n"
+                "         --mode M      : 'quality' (default, byte-identical reference) or 'speed'\n"
+                "                        (real-time: ctx 0.4 + conv tile 2048, ~1 LSB diff)\n"
                 "         --xfade F     : crossfade overlap in seconds (default 0.10)\n"
                 "         --jobs N      : parallel chunk workers (default 4)\n",
                 argv[0]);
@@ -289,6 +291,10 @@ int main(int argc, char **argv) {
                                * arXiv 2505.22487 effective context ~400ms,
                                * mel 0.9632 — opt-in only) */
     float xfade_secs = 0.10f; /* --xfade F: crossfade overlap in seconds (0.10 default) */
+    int mode_speed = 0;       /* --mode speed: all optimizations for real-time
+                               * CPU use (ctx 0.4 + conv tile 2048). Default
+                               * (quality) keeps byte-identical reference
+                               * output for music/master rendering. */
     int jobs = 4;             /* --jobs N: parallel chunk workers (sweet spot measured) */
     int no_chunk = 0;         /* --no-chunk: force the whole-track path (parity) */
     int use_cuda = 0;         /* --cuda: run the GeneratorNSF on the GPU (CUDA) */
@@ -357,6 +363,16 @@ int main(int argc, char **argv) {
             if (jobs < 1) jobs = 1;
             if (jobs > 8) jobs = 8;
             a++;
+        } else if (strcmp(argv[a], "--mode") == 0) {
+            if (strcmp(argv[a + 1], "speed") == 0) {
+                mode_speed = 1;
+            } else if (strcmp(argv[a + 1], "quality") == 0) {
+                mode_speed = 0;
+            } else {
+                fprintf(stderr, "--mode: expected 'quality' or 'speed'\n");
+                return 1;
+            }
+            a++;
         } else if (strcmp(argv[a], "--no-chunk") == 0) {
             no_chunk = 1;
         } else if (strcmp(argv[a], "--cuda") == 0) {
@@ -370,6 +386,18 @@ int main(int argc, char **argv) {
         char pat[1024]; snprintf(pat, sizeof(pat), "%s/*.pth", model_dir);
         /* use the C loader's own dir scan via wubu_rvc_load_weights later;
          * here just try common names */
+    }
+    /* --mode speed: all real-time optimizations (ctx 0.4 + conv tile 2048).
+     * quality (default): byte-identical reference output for rendering. */
+    if (mode_speed) {
+        if (ctx_secs == 0.72f) ctx_secs = 0.40f;  /* don't override explicit --ctx */
+        wubu_set_conv_tile(2048);
+        printf("[0] mode: speed (ctx %.2f, conv tile %d) — real-time CPU\n",
+               ctx_secs, wubu_get_conv_tile());
+    } else {
+        wubu_set_conv_tile(8192);
+        printf("[0] mode: quality (ctx %.2f, conv tile %d) — reference output\n",
+               ctx_secs, wubu_get_conv_tile());
     }
     int use_chunk = (chunk_secs > 0.5f && !no_chunk);
     clock_t t0 = 0;

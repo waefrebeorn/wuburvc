@@ -82,6 +82,16 @@ static float *denorm_cache(const WuBuRVCModel *m, const char *base,
  * oc → j → tap → ic order touched in_ch rows of 11KB+ each per output sample
  * (thousands of cache misses per position); for T=111k × 512ch that was the
  * dominant cost of the whole engine. */
+/* Conv tile size — global so the CLI can switch quality/speed modes.
+ * 8192 (default) = byte-identical reference output; 2048 = speed mode
+ * (4 tiles/call for the MRF's n≈8192 convs, ~3% faster, ~1 LSB diff at
+ * tile boundaries — for real-time use, not for master rendering). */
+static int g_conv_tile = 8192;
+void wubu_set_conv_tile(int tile) {
+    if (tile >= 512 && tile <= 16384) g_conv_tile = tile;
+}
+int wubu_get_conv_tile(void) { return g_conv_tile; }
+
 void conv1d_c(const float *in, int in_ch, int n,
               const float *w, const float *b,
               int out_ch, int k, int stride, int pad, int dil,
@@ -284,12 +294,8 @@ static void conv1d_c_fused_impl(const float *in, int in_ch, int n,
     if (n_out <= 0) return;
     if (!resid) memset(out, 0, (size_t)out_ch * n_out * sizeof(float));
     if (out_ch >= 32) {
-        /* INPUT-STATIONARY tiled conv (same structure as conv1d_c).
-         * TILE=8192 (DO NOT change): TILE=2048 gained ~3% but changed the
-         * tile-boundary accumulation path → maxdiff=1 LSB on 100/900k
-         * samples. The boss's quality bar is BYTE-IDENTICAL output vs the
-         * reference; a 1-LSB diff is not acceptable even if inaudible. */
-        const int TILE = 8192;
+        /* INPUT-STATIONARY tiled conv (same structure as conv1d_c). */
+        const int TILE = g_conv_tile;
 #pragma omp parallel for schedule(dynamic, 4) num_threads(omp_in_parallel() ? 4 : 12) if(n_out >= TILE)
         for (int jb = 0; jb < n_out; jb += TILE) {
             int j_hi = jb + TILE < n_out ? jb + TILE : n_out;

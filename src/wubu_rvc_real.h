@@ -34,6 +34,12 @@ extern "C" {
 int wubu_denorm_tensor(const RVCTensor *g, const RVCTensor *v,
                        float *out, int n_elements);
 
+/* Conv tile size: 8192 (default) = byte-identical reference output;
+ * 2048 = speed mode (~3% faster, ~1 LSB diff at tile boundaries — for
+ * real-time use, NOT for master rendering). */
+void wubu_set_conv_tile(int tile);
+int wubu_get_conv_tile(void);
+
 /* ── Real RVC synthesis (the whole acoustic model) ──
  * model: loaded WuBuRVCModel (tensor map must contain enc_p.*, flow.*,
  *        dec.*, emb_g.weight).

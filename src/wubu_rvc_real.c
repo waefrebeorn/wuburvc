@@ -265,7 +265,12 @@ void conv1d_c(const float *in, int in_ch, int n,
     }
 }
 
-/* ConvTranspose1d, PyTorch weight (in_ch, out_ch, k). out: (n-1)*s - 2p + k */
+/* ConvTranspose1d, PyTorch weight (in_ch, out_ch, k). out: (n-1)*s - 2p + k
+ * POLYPHASE: per output phase p in [0, stride), only taps
+ * tap = (p+pad) % stride + m*stride contribute, and their input index
+ * src = m + (p+pad-tap)/stride advances by 1 per output — the input reads
+ * become contiguous (SIMD-friendly) instead of the old scattered
+ * i→tap writes. Same products, reordered accumulation. */
 static void conv_transpose1d_c(const float *in, int in_ch, int n,
                                const float *w, const float *b,
                                int out_ch, int k, int stride, int pad,
@@ -273,30 +278,26 @@ static void conv_transpose1d_c(const float *in, int in_ch, int n,
     int n_out = (n - 1) * stride - 2 * pad + k;
     if (n_out <= 0) return;
     memset(out, 0, (size_t)out_ch * n_out * sizeof(float));
-    /* oc → ic → i → tap: out row sequential, in row sequential per (oc,ic).
-     * (Old i → ic → oc → tap scattered writes across out_ch rows.) */
 #pragma omp parallel for schedule(static) if(out_ch >= 16 && n >= 512)
     for (int oc = 0; oc < out_ch; oc++) {
         float *orow = out + (size_t)oc * n_out;
+        float bias = b ? b[oc] : 0.0f;
+        for (int j = 0; j < n_out; j++) orow[j] += bias;
         for (int ic = 0; ic < in_ch; ic++) {
             const float *irow = in + (size_t)ic * n;
             if (!w) continue;
             const float *wk = w + ((size_t)ic * out_ch + (size_t)oc) * k;
-            for (int i = 0; i < n; i++) {
-                float inp = irow[i];
-                if (inp == 0.0f) continue;
-                int j0 = i * stride - pad;
-                for (int tap = 0; tap < k; tap++) {
-                    int j = j0 + tap;
-                    if (j >= 0 && j < n_out) orow[j] += inp * wk[tap];
+            for (int p = 0; p < stride; p++) {
+                int m_max = (n_out - 1 - p) / stride + 1;
+                for (int tap = (p + pad) % stride; tap < k; tap += stride) {
+                    int s0 = (p + pad - tap) / stride;   /* src = m + s0 */
+                    float wt = wk[tap];
+                    int m_lo = s0 < 0 ? -s0 : 0;
+                    int m_hi = n - s0 < m_max ? n - s0 : m_max;
+                    for (int m = m_lo; m < m_hi; m++)
+                        orow[p + (size_t)m * stride] += irow[m + s0] * wt;
                 }
             }
-        }
-    }
-    if (b) {
-        for (int oc = 0; oc < out_ch; oc++) {
-            float *orow = out + (size_t)oc * n_out;
-            for (int j = 0; j < n_out; j++) orow[j] += b[oc];
         }
     }
 }
@@ -1333,13 +1334,43 @@ int wubu_generator_nsf(WuBuRVCModel *model,
                             memcpy(rb_in, tmp, (size_t)ch * next_n * sizeof(float));
                         }
                     }
+#if defined(__AVX2__)
+                    {
+                        size_t vi = 0, vn = (size_t)ch * next_n;
+                        for (; vi + 8 <= vn; vi += 8) {
+                            __m256 a = _mm256_loadu_ps(acc_s + vi);
+                            __m256 b = _mm256_loadu_ps(rb_in + vi);
+                            _mm256_storeu_ps(acc_s + vi, _mm256_add_ps(a, b));
+                        }
+                        for (; vi < vn; vi++) acc_s[vi] += rb_in[vi];
+                    }
+#else
                     for (int i = 0; i < ch * next_n; i++) acc_s[i] += rb_in[i];
+#endif
                     if (L == 0 && s == 0 && getenv("WUBU_DUMP_CPU")) {
                         fprintf(stderr, "CPUACCB");
                         for (int q = 0; q < 8; q++) fprintf(stderr, " %.3f", acc_s[q]);
                         fprintf(stderr, "\n");
                     }
                 }
+#if defined(__AVX2__)
+                if (n_stacks <= 8) {
+                    size_t vi = 0, vn = (size_t)ch * next_n;
+                    for (; vi + 8 <= vn; vi += 8) {
+                        __m256 s8 = _mm256_setzero_ps();
+                        for (int st = 0; st < n_stacks; st++)
+                            s8 = _mm256_add_ps(s8, _mm256_loadu_ps(acc + (size_t)st * ch * next_n + vi));
+                        __m256 inv = _mm256_set1_ps(1.0f / (float)n_stacks);
+                        _mm256_storeu_ps(stage[L] + vi, _mm256_mul_ps(s8, inv));
+                    }
+                    for (; vi < vn; vi++) {
+                        float s = 0.0f;
+                        for (int st = 0; st < n_stacks; st++)
+                            s += acc[(size_t)st * ch * next_n + vi];
+                        stage[L][vi] = s / (float)n_stacks;
+                    }
+                } else
+#endif
                 for (int i = 0; i < ch * next_n; i++) {
                     float s = 0.0f;
                     for (int st = 0; st < n_stacks; st++)

@@ -97,6 +97,23 @@ int  wubu_train_step_cuda(WuBuRVCModel *model, WuBuTrainRegistry *reg, WuBuAdamW
                           const float *wav, int n_samples,
                           float *loss_out, int epoch);
 
+/* ── Vulkan training backend (wubu_train_vk.c) ── */
+typedef struct WuBuVk WuBuVk;   /* opaque (wubu_vk.h) */
+typedef struct TrainCacheVk TrainCacheVk;
+
+int  wubu_train_forward_vk(WuBuVk *vk, WuBuRVCModel *model, const float *mel_in,
+                           int n_frames, float *audio, int max_samples,
+                           TrainCacheVk *cache);
+TrainCacheVk *wubu_train_cache_alloc_vk(void);
+void wubu_train_cache_free_vk(TrainCacheVk *cache);
+int  wubu_train_backward_vk(WuBuVk *vk, WuBuRVCModel *model, TrainCacheVk *cache,
+                            const float *mel_in, const float *d_audio,
+                            WuBuTrainRegistry *reg);
+int  wubu_train_step_vk(WuBuVk *vk, WuBuRVCModel *model, WuBuTrainRegistry *reg,
+                        WuBuAdamW *opt, const float *mel_in, int n_frames,
+                        const float *wav, int n_samples,
+                        float *loss_out, int epoch);
+
 /* Public wrapper around the static decoder_backward (Triple-DA A/B for the
  * CUDA training backend). Returns sample count or -1. */
 int wubu_train_backward_cpu(WuBuRVCModel *model, const float *mel_in, int n_frames,

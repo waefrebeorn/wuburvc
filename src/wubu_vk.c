@@ -24,6 +24,9 @@
 #include "wubu_vk_act_spv.h"
 #include "wubu_vk_elt_spv.h"
 #include "wubu_vk_conv_tiled_spv.h"
+#include "wubu_vk_bwd_conv_spv.h"
+#include "wubu_vk_bwd_convt_spv.h"
+#include "wubu_vk_bwd_act_spv.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -68,6 +71,10 @@ struct WuBuVk {
     VkPipeline pipe_conv, pipe_convt, pipe_act, pipe_elt;
     VkPipelineLayout pl_conv_t;      /* stride-1 tiled conv (9-int push: +epi) */
     VkPipeline pipe_conv_t;
+    /* backward training pipelines (6/6/3 storage bindings) */
+    VkDescriptorSetLayout dsl_bwd_conv, dsl_bwd_convt, dsl_bwd_act;
+    VkPipelineLayout pl_bwd_conv, pl_bwd_convt, pl_bwd_act;
+    VkPipeline pipe_bwd_conv, pipe_bwd_convt, pipe_bwd_act;
     VkDescriptorPool dp[4];
     VkDescriptorSet ds_conv, ds_convt, ds_act, ds_elt;
     /* per-dispatch descriptor sets (the shared ds_* are only for the public
@@ -152,7 +159,9 @@ static int pick_mem_type(WuBuVk *vk, uint32_t type_bits, uint32_t *out_idx) {
 /* slot allocation: grow on demand; slot 0..3 are the public conv API. */
 static int pool_slot(WuBuVk *vk, int idx, size_t need) {
     if (idx < 0 || idx >= WUBU_VK_POOL) return -1;
+    if (getenv("WUBU_POOL_DBG")) fprintf(stderr, "POOL idx=%d need=%zu cur=%zu buf=%p\n", idx, need, vk->pcap[idx], (void*)vk->buffers[idx]);
     if (vk->buffers[idx] != VK_NULL_HANDLE && vk->pcap[idx] >= need) return 0;
+    if (getenv("WUBU_POOL_DBG")) fprintf(stderr, "POOL grow idx=%d need=%zu\n", idx, need);
     if (vk->buffers[idx] != VK_NULL_HANDLE) {
         vkDestroyBuffer(vk->dev, vk->buffers[idx], NULL);
         vkFreeMemory(vk->dev, vk->pmem[idx], NULL);
@@ -184,6 +193,7 @@ static int mem_coherent(WuBuVk *vk, int slot) {
 }
 
 static void upload(WuBuVk *vk, int slot, const void *data, size_t sz) {
+    if (getenv("WUBU_POOL_DBG")) fprintf(stderr, "UPLOAD slot=%d sz=%zu psize=%zu\n", slot, sz, vk->psize[slot]);
     void *p = NULL;
     vkMapMemory(vk->dev, vk->pmem[slot], 0, vk->psize[slot], 0, &p);
     if (data) memcpy(p, data, sz); else memset(p, 0, sz);
@@ -226,8 +236,10 @@ static int wslot(WuBuVk *vk, const char *name, const void *data, size_t sz) {
 }
 
 static void download(WuBuVk *vk, int slot, void *out, size_t sz) {
+    if (getenv("WUBU_DL_DBG")) fprintf(stderr, "DL enter slot=%d sz=%zu psize=%zu\n", slot, sz, vk->psize[slot]);
     void *p = NULL;
     vkMapMemory(vk->dev, vk->pmem[slot], 0, vk->psize[slot], 0, &p);
+    if (getenv("WUBU_DL_DBG")) fprintf(stderr, "DL map ok slot=%d p=%p\n", slot, p);
     if (!mem_coherent(vk, slot)) {
         VkMappedMemoryRange r = { .sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
                                   .memory = vk->pmem[slot], .offset = 0, .size = sz };
@@ -486,7 +498,7 @@ static int mk_pipe(WuBuVk *vk, const unsigned char *spv, size_t spv_len,
     VkShaderModuleCreateInfo smci = { .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
                                       .codeSize = spv_len, .pCode = (const uint32_t *)spv };
     if (vkCreateShaderModule(vk->dev, &smci, NULL, &sm) != VK_SUCCESS) return -1;
-    VkDescriptorSetLayoutBinding binds[4] = {0};
+    VkDescriptorSetLayoutBinding binds[6] = {0};
     for (int i = 0; i < n_binds; i++) {
         binds[i].binding = i;
         binds[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -594,6 +606,12 @@ WuBuVk *wubu_vk_create(void) {
                 &vk->dsl_act, &vk->pl_act, &vk->pipe_act, 4 * sizeof(float))) goto fail;
     if (mk_pipe(vk, WUBU_VK_ELT_SPV, sizeof(WUBU_VK_ELT_SPV), 2,
                 &vk->dsl_elt, &vk->pl_elt, &vk->pipe_elt, 2 * sizeof(int))) goto fail;
+    if (mk_pipe(vk, WUBU_VK_BWD_CONV_SPV, sizeof(WUBU_VK_BWD_CONV_SPV), 6,
+                &vk->dsl_bwd_conv, &vk->pl_bwd_conv, &vk->pipe_bwd_conv, 8 * sizeof(int))) goto fail;
+    if (mk_pipe(vk, WUBU_VK_BWD_CONVT_SPV, sizeof(WUBU_VK_BWD_CONVT_SPV), 6,
+                &vk->dsl_bwd_convt, &vk->pl_bwd_convt, &vk->pipe_bwd_convt, 7 * sizeof(int))) goto fail;
+    if (mk_pipe(vk, WUBU_VK_BWD_ACT_SPV, sizeof(WUBU_VK_BWD_ACT_SPV), 3,
+                &vk->dsl_bwd_act, &vk->pl_bwd_act, &vk->pipe_bwd_act, 2 * sizeof(int))) goto fail;
     vk->ds_conv = alloc_ds(vk, 0, vk->dsl_conv);
     vk->ds_convt = alloc_ds(vk, 1, vk->dsl_conv);
     vk->ds_act = alloc_ds(vk, 2, vk->dsl_act);
@@ -621,6 +639,15 @@ void wubu_vk_destroy(WuBuVk *vk) {
         if (vk->pipe_conv_t) vkDestroyPipeline(vk->dev, vk->pipe_conv_t, NULL);
         if (vk->pipe_act) vkDestroyPipeline(vk->dev, vk->pipe_act, NULL);
         if (vk->pipe_elt) vkDestroyPipeline(vk->dev, vk->pipe_elt, NULL);
+        if (vk->pipe_bwd_conv) vkDestroyPipeline(vk->dev, vk->pipe_bwd_conv, NULL);
+        if (vk->pipe_bwd_convt) vkDestroyPipeline(vk->dev, vk->pipe_bwd_convt, NULL);
+        if (vk->pipe_bwd_act) vkDestroyPipeline(vk->dev, vk->pipe_bwd_act, NULL);
+        if (vk->pl_bwd_conv) vkDestroyPipelineLayout(vk->dev, vk->pl_bwd_conv, NULL);
+        if (vk->pl_bwd_convt) vkDestroyPipelineLayout(vk->dev, vk->pl_bwd_convt, NULL);
+        if (vk->pl_bwd_act) vkDestroyPipelineLayout(vk->dev, vk->pl_bwd_act, NULL);
+        if (vk->dsl_bwd_conv) vkDestroyDescriptorSetLayout(vk->dev, vk->dsl_bwd_conv, NULL);
+        if (vk->dsl_bwd_convt) vkDestroyDescriptorSetLayout(vk->dev, vk->dsl_bwd_convt, NULL);
+        if (vk->dsl_bwd_act) vkDestroyDescriptorSetLayout(vk->dev, vk->dsl_bwd_act, NULL);
         if (vk->pl_conv) vkDestroyPipelineLayout(vk->dev, vk->pl_conv, NULL);
         if (vk->pl_conv_t) vkDestroyPipelineLayout(vk->dev, vk->pl_conv_t, NULL);
         if (vk->pl_act) vkDestroyPipelineLayout(vk->dev, vk->pl_act, NULL);
@@ -710,6 +737,229 @@ int wubu_vk_convt1d(WuBuVk *vk,
     vkQueueSubmit(vk->q, 1, &si, VK_NULL_HANDLE);
     vkQueueWaitIdle(vk->q);
     download(vk, 3, out, out_sz);
+    return 0;
+}
+
+/* ── training backward: record conv1d_bwd dispatch (6 buffers) ── */
+static void rec_bwd_conv1d(WuBuVk *vk, int in_s, int w_s, int dout_s,
+                           int din_s, int dw_s, int db_s,
+                           int in_ch, int out_ch, int k, int stride,
+                           int pad, int dil, int n_in, int n_out) {
+    rec_sync(vk);
+    VkDescriptorSet ds = dspool_get(vk, vk->dsl_bwd_conv);
+    if (ds == VK_NULL_HANDLE) return;
+    VkDescriptorBufferInfo dbi[6] = {
+        {vk->buffers[in_s], 0, (size_t)in_ch * n_in * 4},
+        {vk->buffers[w_s], 0, (size_t)out_ch * in_ch * k * 4},
+        {vk->buffers[dout_s], 0, (size_t)out_ch * n_out * 4},
+        {vk->buffers[din_s], 0, (size_t)in_ch * n_in * 4},
+        {vk->buffers[dw_s], 0, (size_t)out_ch * in_ch * k * 4},
+        {vk->buffers[db_s], 0, (size_t)out_ch * 4},
+    };
+    VkWriteDescriptorSet wds[6] = {0};
+    for (int i = 0; i < 6; i++) {
+        wds[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wds[i].dstSet = ds; wds[i].dstBinding = i; wds[i].descriptorCount = 1;
+        wds[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        wds[i].pBufferInfo = &dbi[i];
+    }
+    vkUpdateDescriptorSets(vk->dev, 6, wds, 0, NULL);
+    vkCmdBindPipeline(vk->cb, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_bwd_conv);
+    vkCmdBindDescriptorSets(vk->cb, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pl_bwd_conv, 0, 1, &ds, 0, NULL);
+    int pc[8] = { in_ch, out_ch, k, stride, pad, dil, n_in, n_out };
+    vkCmdPushConstants(vk->cb, vk->pl_bwd_conv, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+    vkCmdDispatch(vk->cb, (uint32_t)out_ch, (uint32_t)((n_out + 255) / 256), 1);  /* wg per (oc, j-tile) */
+    vk->last_written = din_s;
+    rec_flush(vk);
+}
+
+/* record convT1d_bwd dispatch: one wg per (tile, ic) — grid = (ceil(n_in/256), in_ch) */
+static void rec_bwd_convt1d(WuBuVk *vk, int in_s, int w_s, int dout_s,
+                            int din_s, int dw_s, int db_s,
+                            int in_ch, int out_ch, int k, int stride,
+                            int pad, int n_in, int n_out) {
+    rec_sync(vk);
+    VkDescriptorSet ds = dspool_get(vk, vk->dsl_bwd_convt);
+    if (ds == VK_NULL_HANDLE) return;
+    VkDescriptorBufferInfo dbi[6] = {
+        {vk->buffers[in_s], 0, (size_t)in_ch * n_in * 4},
+        {vk->buffers[w_s], 0, (size_t)in_ch * out_ch * k * 4},
+        {vk->buffers[dout_s], 0, (size_t)out_ch * n_out * 4},
+        {vk->buffers[din_s], 0, (size_t)in_ch * n_in * 4},
+        {vk->buffers[dw_s], 0, (size_t)in_ch * out_ch * k * 4},
+        {vk->buffers[db_s], 0, (size_t)out_ch * 4},
+    };
+    VkWriteDescriptorSet wds[6] = {0};
+    for (int i = 0; i < 6; i++) {
+        wds[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wds[i].dstSet = ds; wds[i].dstBinding = i; wds[i].descriptorCount = 1;
+        wds[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        wds[i].pBufferInfo = &dbi[i];
+    }
+    vkUpdateDescriptorSets(vk->dev, 6, wds, 0, NULL);
+    vkCmdBindPipeline(vk->cb, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_bwd_convt);
+    vkCmdBindDescriptorSets(vk->cb, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pl_bwd_convt, 0, 1, &ds, 0, NULL);
+    int pc[7] = { in_ch, out_ch, k, stride, pad, n_in, n_out };
+    vkCmdPushConstants(vk->cb, vk->pl_bwd_convt, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+    vkCmdDispatch(vk->cb, (uint32_t)((n_in + 255) / 256), (uint32_t)in_ch, 1);
+    vk->last_written = din_s;
+    rec_flush(vk);
+}
+
+/* record backward activation: x_s PRE/POST-act, dout_s, din_s; mode 0 lrelu, 1 tanh */
+static void rec_bwd_act(WuBuVk *vk, int x_s, int dout_s, int din_s, int mode, size_t n) {
+    rec_sync(vk);
+    VkDescriptorSet ds = dspool_get(vk, vk->dsl_bwd_act);
+    if (ds == VK_NULL_HANDLE) return;
+    VkDescriptorBufferInfo dbi[3] = {
+        {vk->buffers[x_s], 0, n * 4},
+        {vk->buffers[dout_s], 0, n * 4},
+        {vk->buffers[din_s], 0, n * 4},
+    };
+    VkWriteDescriptorSet wds[3] = {0};
+    for (int i = 0; i < 3; i++) {
+        wds[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        wds[i].dstSet = ds; wds[i].dstBinding = i; wds[i].descriptorCount = 1;
+        wds[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        wds[i].pBufferInfo = &dbi[i];
+    }
+    vkUpdateDescriptorSets(vk->dev, 3, wds, 0, NULL);
+    vkCmdBindPipeline(vk->cb, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pipe_bwd_act);
+    vkCmdBindDescriptorSets(vk->cb, VK_PIPELINE_BIND_POINT_COMPUTE, vk->pl_bwd_act, 0, 1, &ds, 0, NULL);
+    int pc[2] = { mode, (int)n };
+    vkCmdPushConstants(vk->cb, vk->pl_bwd_act, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+    vkCmdDispatch(vk->cb, (uint32_t)((n + 255) / 256), 1, 1);
+    vk->last_written = din_s;
+    rec_flush(vk);
+}
+
+/* ── public backward ops (synchronous, host buffers — mirrors wubu_vk_conv1d
+ * convention: upload, one dispatch, submit, download). din/dw/db MUST be
+ * zeroed by the caller before the call (accumulation). Returns 0 / -1. ── */
+int wubu_vk_bwd_conv1d(WuBuVk *vk,
+                       const float *in, int in_ch,
+                       const float *w, const float *dout,
+                       int out_ch, int k, int stride, int pad, int dil,
+                       int n_in, int n_out,
+                       float *din, float *dw, float *db) {
+    if (!vk || !in || !w || !dout || !din || !dw || !db) { if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG bwd_conv NULL arg\n"); return -1; }
+    /* slots: 4 in, 5 w, 6 dout, 7 din, 8 dw, 9 db (0-3 = public conv API) */
+    size_t in_sz = (size_t)in_ch * n_in * 4;
+    size_t w_sz = (size_t)out_ch * in_ch * k * 4;
+    size_t dout_sz = (size_t)out_ch * n_out * 4;
+    size_t db_sz = (size_t)out_ch * 4;
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG bwd_conv in=%d out=%d n=%d k=%d pool[4]=%zu need=%zu\n",
+            in_ch, out_ch, n_out, k, vk->pcap[4], in_sz);
+    if (pool_slot(vk, 4, in_sz) || pool_slot(vk, 5, w_sz) ||
+        pool_slot(vk, 6, dout_sz) || pool_slot(vk, 7, in_sz) ||
+        pool_slot(vk, 8, w_sz) || pool_slot(vk, 9, db_sz)) return -1;
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG bwd_conv slots ok\n");
+    upload(vk, 4, in, in_sz);
+    upload(vk, 5, w, w_sz);
+    upload(vk, 6, dout, dout_sz);
+    upload(vk, 7, NULL, in_sz);    /* zero din */
+    upload(vk, 8, NULL, w_sz);     /* zero dw */
+    upload(vk, 9, NULL, db_sz);    /* zero db */
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG bwd_conv uploads ok\n");
+    VkCommandBufferBeginInfo cbbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    vkBeginCommandBuffer(vk->cb, &cbbi);
+    rec_bwd_conv1d(vk, 4, 5, 6, 7, 8, 9, in_ch, out_ch, k, stride, pad, dil, n_in, n_out);
+    vkEndCommandBuffer(vk->cb);
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1,
+                        .pCommandBuffers = &vk->cb };
+    vkQueueSubmit(vk->q, 1, &si, VK_NULL_HANDLE);
+    vkQueueWaitIdle(vk->q);
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG bwd_conv submit ok\n");
+    if (getenv("WUBU_DL_DBG")) fprintf(stderr, "DL p7=%zu p8=%zu p9=%zu sz=%zu\n", vk->psize[7], vk->psize[8], vk->psize[9], in_sz);
+    download(vk, 7, din, in_sz);
+    download(vk, 8, dw, w_sz);
+    download(vk, 9, db, db_sz);
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG bwd_conv downloads ok\n");
+    return 0;
+}
+
+int wubu_vk_bwd_convt1d(WuBuVk *vk,
+                        const float *in, int in_ch,
+                        const float *w, const float *dout,
+                        int out_ch, int k, int stride, int pad,
+                        int n_in, int n_out,
+                        float *din, float *dw, float *db) {
+    if (!vk || !in || !w || !dout || !din || !dw || !db) return -1;
+    size_t in_sz = (size_t)in_ch * n_in * 4;
+    size_t w_sz = (size_t)in_ch * out_ch * k * 4;
+    size_t dout_sz = (size_t)out_ch * n_out * 4;
+    size_t db_sz = (size_t)out_ch * 4;
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG bwd_convt in=%d out=%d nin=%d nout=%d k=%d pool[4]=%zu need=%zu\n",
+            in_ch, out_ch, n_in, n_out, k, vk->pcap[4], in_sz);
+    if (pool_slot(vk, 4, in_sz) || pool_slot(vk, 5, w_sz) ||
+        pool_slot(vk, 6, dout_sz) || pool_slot(vk, 7, in_sz) ||
+        pool_slot(vk, 8, w_sz) || pool_slot(vk, 9, db_sz)) return -1;
+    upload(vk, 4, in, in_sz);
+    upload(vk, 5, w, w_sz);
+    upload(vk, 6, dout, dout_sz);
+    upload(vk, 7, NULL, in_sz);
+    upload(vk, 8, NULL, w_sz);
+    upload(vk, 9, NULL, db_sz);
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG bwd_convt uploads ok\n");
+    VkCommandBufferBeginInfo cbbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    vkBeginCommandBuffer(vk->cb, &cbbi);
+    rec_bwd_convt1d(vk, 4, 5, 6, 7, 8, 9, in_ch, out_ch, k, stride, pad, n_in, n_out);
+    vkEndCommandBuffer(vk->cb);
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1,
+                        .pCommandBuffers = &vk->cb };
+    vkQueueSubmit(vk->q, 1, &si, VK_NULL_HANDLE);
+    vkQueueWaitIdle(vk->q);
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG bwd_convt submit ok\n");
+    download(vk, 7, din, in_sz);
+    download(vk, 8, dw, w_sz);
+    download(vk, 9, db, db_sz);
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG bwd_convt downloads ok\n");
+    return 0;
+}
+
+int wubu_vk_bwd_act(WuBuVk *vk, const float *x, const float *dout,
+                    float *din, int mode, size_t n) {
+    if (!vk || !x || !dout || !din) return -1;
+    size_t sz = n * 4;
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG bwd_act n=%zu mode=%d pool4=%zu need=%zu\n", n, mode, vk->pcap[4], sz);
+    if (pool_slot(vk, 4, sz) || pool_slot(vk, 6, sz) || pool_slot(vk, 7, sz)) return -1;
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG bwd_act slots ok\n");
+    upload(vk, 4, x, sz);
+    upload(vk, 6, dout, sz);
+    upload(vk, 7, NULL, sz);   /* zero din (not strictly needed: full write) */
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG bwd_act uploads ok\n");
+    VkCommandBufferBeginInfo cbbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    vkBeginCommandBuffer(vk->cb, &cbbi);
+    rec_bwd_act(vk, 4, 6, 7, mode, n);
+    vkEndCommandBuffer(vk->cb);
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1,
+                        .pCommandBuffers = &vk->cb };
+    vkQueueSubmit(vk->q, 1, &si, VK_NULL_HANDLE);
+    vkQueueWaitIdle(vk->q);
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG bwd_act submit ok\n");
+    download(vk, 7, din, sz);
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "VKDBG bwd_act download ok\n");
+    return 0;
+}
+
+/* public activation op (forward): mode 0 lrelu0.1, 2 tanh, 4 x*=scalar.
+ * x is host [n_ch*n]; o may be NULL. Synchronous. */
+int wubu_vk_act(WuBuVk *vk, float *x, const float *o, int mode,
+                int n_ch, int n, float sc) {
+    if (!vk || !x) return -1;
+    size_t sz = (size_t)n_ch * n * 4;
+    if (pool_slot(vk, 4, sz) || (o && pool_slot(vk, 5, (size_t)n_ch * 4))) return -1;
+    upload(vk, 4, x, sz);
+    if (o) upload(vk, 5, o, (size_t)n_ch * 4);
+    VkCommandBufferBeginInfo cbbi = { .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    vkBeginCommandBuffer(vk->cb, &cbbi);
+    rec_act(vk, 4, o ? 5 : -1, mode, n_ch, n, sc);
+    vkEndCommandBuffer(vk->cb);
+    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1,
+                        .pCommandBuffers = &vk->cb };
+    vkQueueSubmit(vk->q, 1, &si, VK_NULL_HANDLE);
+    vkQueueWaitIdle(vk->q);
+    download(vk, 4, x, sz);
     return 0;
 }
 

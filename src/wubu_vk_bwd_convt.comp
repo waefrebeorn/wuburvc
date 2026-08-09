@@ -1,0 +1,69 @@
+#version 450
+#extension GL_EXT_shader_atomic_float : require
+layout(local_size_x = 256) in;
+
+/* convT1d backward — one workgroup per input position tile x input channel.
+ * Matches tk_convt1d_bwd in wubu_train_cuda.cu / convt1d_bwd in wubu_train.c.
+ * ConvT weight layout: W[(ic*out_ch + oc)*k + tap] (PyTorch ConvTranspose1d).
+ *   din[ic, i] += sum_oc sum_tap g[oc, j] * w[ic, oc, tap], j = i*stride - pad + tap
+ *   dw[ic, oc, tap] += in[ic, i] * g[oc, j]
+ *   db[oc] += sum_j g[oc, j]
+ * din/dw/db must be zeroed before dispatch.
+ */
+layout(set = 0, binding = 0) buffer InBuf   { float in_f[]; };    /* [in_ch * n_in] */
+layout(set = 0, binding = 1) buffer WBuf    { float w_f[]; };     /* [in_ch * out_ch * k] */
+layout(set = 0, binding = 2) buffer DOutBuf { float dout_f[]; };  /* [out_ch * n_out] */
+layout(set = 0, binding = 3) buffer DInBuf  { float din_f[]; };   /* [in_ch * n_in] */
+layout(set = 0, binding = 4) buffer DWBuf   { float dw_f[]; };    /* [in_ch * out_ch * k] */
+layout(set = 0, binding = 5) buffer DBBuf   { float db_f[]; };    /* [out_ch] */
+
+layout(push_constant) uniform PC {
+    int in_ch;
+    int out_ch;
+    int k;
+    int stride;
+    int pad;
+    int n_in;
+    int n_out;
+} pc;
+
+void main() {
+    int tile = int(gl_WorkGroupID.x);
+    int ic   = int(gl_WorkGroupID.y);
+    if (ic >= pc.in_ch) return;
+    int i0 = tile * 256;
+
+    int din_base = ic * pc.n_in;
+    int wb_base  = ic * pc.out_ch * pc.k;
+
+    for (int i = i0 + int(gl_LocalInvocationIndex.x);
+         i < pc.n_in && i < i0 + 256;
+         i += 256) {
+        int j_start = i * pc.stride - pc.pad;
+        float din_acc = 0.0;
+        for (int oc = 0; oc < pc.out_ch; oc++) {
+            int wb = wb_base + oc * pc.k;
+            int dout_base = oc * pc.n_out;
+            float x = in_f[din_base + i];
+            for (int tap = 0; tap < pc.k; tap++) {
+                int j = j_start + tap;
+                if (j >= 0 && j < pc.n_out) {
+                    float g = dout_f[dout_base + j];
+                    din_acc += g * w_f[wb + tap];
+                    atomicAdd(dw_f[wb + tap], x * g);
+                }
+            }
+        }
+        atomicAdd(din_f[din_base + i], din_acc);
+    }
+
+    /* db[oc] = sum_j g — compute ONCE (tile==0 && ic==0 workgroup only) */
+    if (tile == 0 && ic == 0 && gl_LocalInvocationIndex.x == 0) {
+        for (int oc = 0; oc < pc.out_ch; oc++) {
+            float acc = 0.0;
+            int dout_base = oc * pc.n_out;
+            for (int j = 0; j < pc.n_out; j++) acc += dout_f[dout_base + j];
+            atomicAdd(db_f[oc], acc);
+        }
+    }
+}

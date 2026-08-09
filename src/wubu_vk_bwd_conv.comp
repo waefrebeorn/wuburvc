@@ -1,0 +1,64 @@
+#version 450
+#extension GL_EXT_shader_atomic_float : require
+layout(local_size_x = 256) in;
+
+/* conv1d backward — one workgroup per (out_ch, j-tile of 256).
+ * Much better parallelization than per-(oc,ic): total atomic ops drop from
+ * in_ch*out_ch*n_out*k (per-oc-ic workgroups) to out_ch*n_out*k (per-j).
+ * Matches tk_conv1d_bwd in wubu_train_cuda.cu / conv1d_bwd in wubu_train.c:
+ *   din[ic, src] += g * w[oc, ic, tap]      (g = dout[oc, j])
+ *   dw[oc, ic, tap] += x[ic, src] * g
+ *   db[oc] += g
+ * Buffers must be zeroed before dispatch (din, dw, db).
+ */
+layout(set = 0, binding = 0) buffer InBuf   { float in_f[]; };    /* [in_ch * n_in] */
+layout(set = 0, binding = 1) buffer WBuf    { float w_f[]; };     /* [out_ch * in_ch * k] */
+layout(set = 0, binding = 2) buffer DOutBuf { float dout_f[]; };  /* [out_ch * n_out] */
+layout(set = 0, binding = 3) buffer DInBuf  { float din_f[]; };   /* [in_ch * n_in] */
+layout(set = 0, binding = 4) buffer DWBuf   { float dw_f[]; };    /* [out_ch * in_ch * k] */
+layout(set = 0, binding = 5) buffer DBBuf   { float db_f[]; };    /* [out_ch] */
+
+layout(push_constant) uniform PC {
+    int in_ch;
+    int out_ch;
+    int k;
+    int stride;
+    int pad;
+    int dil;
+    int n_in;
+    int n_out;
+} pc;
+
+void main() {
+    int oc = int(gl_WorkGroupID.x);
+    int tile = int(gl_WorkGroupID.y);
+    if (oc >= pc.out_ch) return;
+    int j0 = tile * 256;
+    int dout_base = oc * pc.n_out;
+    int wb_base = oc * pc.in_ch * pc.k;
+
+    for (int j = j0 + int(gl_LocalInvocationIndex.x);
+         j < pc.n_out && j < j0 + 256;
+         j += 256) {
+        float g = dout_f[dout_base + j];
+        int j_in = j * pc.stride - pc.pad;
+        for (int tap = 0; tap < pc.k; tap++) {
+            int src = j_in + tap * pc.dil;
+            if (src >= 0 && src < pc.n_in) {
+                for (int ic = 0; ic < pc.in_ch; ic++) {
+                    float x = in_f[ic * pc.n_in + src];
+                    float wv = w_f[wb_base + ic * pc.k + tap];
+                    atomicAdd(dw_f[wb_base + ic * pc.k + tap], x * g);
+                    atomicAdd(din_f[ic * pc.n_in + src], g * wv);
+                }
+            }
+        }
+    }
+
+    /* db[oc] = sum_j g — one lane of workgroup (oc, tile==0) computes */
+    if (tile == 0 && gl_LocalInvocationIndex.x == 0) {
+        float acc = 0.0;
+        for (int j = 0; j < pc.n_out; j++) acc += dout_f[dout_base + j];
+        atomicAdd(db_f[oc], acc);
+    }
+}

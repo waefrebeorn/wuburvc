@@ -58,4 +58,31 @@ int wubu_vk_generator_nsf(WuBuVk *vk, WuBuRVCModel *model,
                           float *out_audio, int max_samples,
                           int inject_noise, int use_snake);
 
+/* ── training backward ops (synchronous, host buffers) ──
+ * conv1d_bwd: din[ic,src] += g*w, dw[oc,ic,tap] += x*g, db[oc] += g.
+ *   in [in_ch*n_in], w [out_ch*in_ch*k], dout [out_ch*n_out],
+ *   din/dw/db must be ZEROED by the caller (accumulation target).
+ * convT1d_bwd: w layout [in_ch*out_ch*k] (PyTorch ConvTranspose1d).
+ * act_bwd: mode 0 lrelu (x = PRE-act), 1 tanh (x = POST-act).
+ * Returns 0 on success, -1 on failure. */
+int wubu_vk_bwd_conv1d(WuBuVk *vk,
+                       const float *in, int in_ch,
+                       const float *w, const float *dout,
+                       int out_ch, int k, int stride, int pad, int dil,
+                       int n_in, int n_out,
+                       float *din, float *dw, float *db);
+int wubu_vk_bwd_convt1d(WuBuVk *vk,
+                        const float *in, int in_ch,
+                        const float *w, const float *dout,
+                        int out_ch, int k, int stride, int pad,
+                        int n_in, int n_out,
+                        float *din, float *dw, float *db);
+int wubu_vk_bwd_act(WuBuVk *vk, const float *x, const float *dout,
+                    float *din, int mode, size_t n);
+
+/* public activation op (forward): mode 0 lrelu0.1, 2 tanh, 4 x*=scalar.
+ * x is host [n_ch*n]; o may be NULL. Synchronous. */
+int wubu_vk_act(WuBuVk *vk, float *x, const float *o, int mode,
+                int n_ch, int n, float sc);
+
 #endif /* WUBU_VK_H */

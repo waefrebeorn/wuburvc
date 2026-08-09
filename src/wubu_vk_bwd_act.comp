@@ -1,0 +1,28 @@
+#version 450
+layout(local_size_x = 256) in;
+
+/* backward activations.
+ * mode 0: lrelu_bwd — din[i] = dout[i] * (x[i] > 0 ? 1 : 0.1)   (x = PRE-act)
+ * mode 1: tanh_bwd  — din[i] = dout[i] * (1 - x[i]^2)            (x = POST-act)
+ * Buffers are elementwise; no cross-lane dependency.
+ */
+layout(set = 0, binding = 0) buffer XBuf   { float x_f[]; };   /* pre/post activation */
+layout(set = 0, binding = 1) buffer DOutBuf { float dout_f[]; };
+layout(set = 0, binding = 2) buffer DInBuf  { float din_f[]; };
+
+layout(push_constant) uniform PC {
+    int mode;
+    int n;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(pc.n)) return;
+    float x = x_f[i];
+    float g = dout_f[i];
+    if (pc.mode == 0) {
+        din_f[i] = g * (x > 0.0 ? 1.0 : 0.1);
+    } else {
+        din_f[i] = g * (1.0 - x * x);
+    }
+}

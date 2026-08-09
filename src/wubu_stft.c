@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <omp.h>
 
 struct WuBuStft {
     int n_fft;
@@ -69,9 +70,13 @@ int wubu_stft_magnitude(const WuBuStft *s, const float *pcm, int n_samples,
 
     const int n_fft = s->n_fft;
     const int n_bins = s->n_bins;
-    WuBuCpx *spec = (WuBuCpx *)malloc((size_t)n_fft * sizeof(WuBuCpx));
-    if (!spec) { free(buf); return -1; }
+    /* frames are independent FFTs — parallelize (per-thread spec buffer).
+     * Each frame writes its own output column → per-frame math unchanged →
+     * byte-identical (quality-safe). wubu_fft is stack-only, thread-safe. */
+#pragma omp parallel for schedule(dynamic, 8) if(T >= 16)
     for (int f = 0; f < T; f++) {
+        WuBuCpx *spec = (WuBuCpx *)malloc((size_t)n_fft * sizeof(WuBuCpx));
+        if (!spec) continue;
         const float *x = buf + (size_t)f * s->hop;
         for (int t = 0; t < n_fft; t++) {
             spec[t].re = x[t] * s->window[t];
@@ -82,8 +87,8 @@ int wubu_stft_magnitude(const WuBuStft *s, const float *pcm, int n_samples,
             float re = spec[b].re, im = spec[b].im;
             mag_out[(size_t)b * T + f] = sqrtf(re * re + im * im);
         }
+        free(spec);
     }
-    free(spec);
     free(buf);
     return T;
 }

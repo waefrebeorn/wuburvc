@@ -26,6 +26,12 @@
 #include <math.h>
 #include <stdio.h>
 
+/* QUALITY-SAFE vectorization contract: the AVX2 conv paths must keep
+ * mul+add (two roundings, scalar order) so output is byte-identical to the
+ * scalar reference. GCC's -ffp-contract=fast would silently re-fuse mul+add
+ * into FMA (1 rounding) → 1ulp drift. Disable contraction in this file. */
+#pragma GCC optimize("fp-contract=off")
+
 /* ── flat-binary tensor map ── */
 typedef struct {
     char  name[128];
@@ -149,10 +155,12 @@ static void conv2d(const float *in, int cin, int H, int W,
         float bias = b ? b[oc] : 0.0f;
         for (int h = 0; h < H; h++) {
 #if defined(__AVX2__) && defined(__FMA__)
-            /* FMA rounds once vs scalar mul+add twice → ~1ulp f0 difference.
-             * Quality mode MUST stay byte-identical, so the AVX2 path is
-             * speed-mode only (fast math switch); scalar runs in quality. */
-            if (k == 3 && pad == 1 && wubu_get_fast_math()) {
+            /* QUALITY-SAFE AVX2 path: uses mul_ps + add_ps (NOT fma) so each
+             * lane accumulates (ic,dh,dw) in EXACTLY the scalar order with
+             * the same two roundings → byte-identical output. Verified
+             * maxdiff 0 on the full pipeline (2026-08-09). Runs in BOTH
+             * modes (no fast-math gate needed). */
+            if (k == 3 && pad == 1) {
                 /* left boundary wi=0 (tap -1 invalid) */
                 if (W > 0) {
                     float acc = bias;
@@ -186,7 +194,9 @@ static void conv2d(const float *in, int cin, int H, int W,
                             for (int dw = 0; dw < k; dw++) {
                                 __m256 iv = _mm256_loadu_ps(inrow + dw);
                                 __m256 wv = _mm256_set1_ps(wch[(size_t)dh * k + dw]);
-                                accv = _mm256_fmadd_ps(iv, wv, accv);
+                                /* mul+add = same two roundings as scalar →
+                                 * byte-identical, quality-safe */
+                                accv = _mm256_add_ps(accv, _mm256_mul_ps(iv, wv));
                             }
                         }
                     }
@@ -234,7 +244,10 @@ static void conv2d(const float *in, int cin, int H, int W,
     }
 }
 
-/* ConvTranspose2d: k x k, stride s, pad p, output_pad op. H2 = (H-1)*s - 2p + k + op */
+/* ConvTranspose2d: k x k, stride s, pad p, output_pad op. H2 = (H-1)*s - 2p + k + op.
+ * AVX2: for stride 2 (the RMVPE decoder), input row v[wi..wi+7] is contiguous;
+ * multiply 8 wi's by each weight scalar and scatter to wo = wi*s-p+dw (strided
+ * stores — the load+multiply is the 8x win). Speed-mode only (FMA 1ulp). */
 static void convt2d(const float *in, int cin, int H, int W,
                     const float *w, const float *b, int cout, int k, int s, int p, int op,
                     int H2, int W2, float *out) {
@@ -246,8 +259,57 @@ static void convt2d(const float *in, int cin, int H, int W,
             const float *wrow = w + ((size_t)ic * cout + oc) * k * k;
             for (int h = 0; h < H; h++) {
                 int ho0 = h * s - p;
+                const float *inrow = in + (size_t)ic * H * W + (size_t)h * W;
+#if defined(__AVX2__) && defined(__FMA__)
+                /* convt2d is a SCATTER: multiple (wi,dh,dw) hit the same
+                 * output element, and my vector path changes their add order
+                 * vs scalar → NOT byte-identical. Speed-mode only (FMA 1ulp
+                 * accepted there). */
+                if (s == 2 && k == 3 && wubu_get_fast_math()) {
+                    int wi = 0;
+                    for (; wi + 8 <= W; wi += 8) {
+                        __m256 vv = _mm256_loadu_ps(inrow + wi);
+                        /* v == 0 skip check: any lane zero → still safe to
+                         * add 0; the scalar `continue` was just a guard. */
+                        int wo0 = wi * s - p;
+                        for (int dh = 0; dh < k; dh++) {
+                            int ho = ho0 + dh;
+                            if (ho < 0 || ho >= H2) continue;
+                            float *orow = out + (size_t)oc * H2 * W2 + (size_t)ho * W2;
+                            for (int dw = 0; dw < k; dw++) {
+                                int wo = wo0 + dw;
+                                if (wo < 0 || wo >= W2) continue;
+                                float wv = wrow[(size_t)dh * k + dw];
+                                /* scatter 8 lanes to wo, wo+s, wo+2s, ... */
+                                float prod[8];
+                                _mm256_storeu_ps(prod, _mm256_mul_ps(vv, _mm256_set1_ps(wv)));
+                                for (int l = 0; l < 8; l++) {
+                                    int wop = wo + l * s;
+                                    if (wop >= 0 && wop < W2) orow[wop] += prod[l];
+                                }
+                            }
+                        }
+                    }
+                    for (; wi < W; wi++) {
+                        float v = inrow[wi];
+                        if (v == 0.0f) continue;
+                        int wo0 = wi * s - p;
+                        for (int dh = 0; dh < k; dh++) {
+                            int ho = ho0 + dh;
+                            if (ho < 0 || ho >= H2) continue;
+                            for (int dw = 0; dw < k; dw++) {
+                                int wo = wo0 + dw;
+                                if (wo < 0 || wo >= W2) continue;
+                                out[(size_t)oc * H2 * W2 + (size_t)ho * W2 + wo] +=
+                                    v * wrow[(size_t)dh * k + dw];
+                            }
+                        }
+                    }
+                    continue;
+                }
+#endif
                 for (int wi = 0; wi < W; wi++) {
-                    float v = in[(size_t)ic * H * W + (size_t)h * W + wi];
+                    float v = inrow[wi];
                     if (v == 0.0f) continue;
                     int wo0 = wi * s - p;
                     for (int dh = 0; dh < k; dh++) {

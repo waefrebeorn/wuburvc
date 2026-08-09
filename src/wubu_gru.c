@@ -12,6 +12,7 @@
 #define _USE_MATH_DEFINES
 #include "wubu_gru.h"
 #include "wubu_math.h"
+#include <immintrin.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -91,6 +92,28 @@ static void gru_dir_run(const GruDir *d, const float *x, int T, float *hseq) {
             float acc = d->b_ih[row] + d->b_hh[row];
             const float *wi = d->w_ih + (size_t)row * in;
             const float *wh = d->w_hh + (size_t)row * h;
+#if defined(__AVX2__) && defined(__FMA__)
+            if (wubu_get_fast_math()) {
+                __m256 accv = _mm256_setzero_ps();
+                int i = 0;
+                for (; i + 8 <= in; i += 8)
+                    accv = _mm256_fmadd_ps(_mm256_loadu_ps(wi + i),
+                                           _mm256_loadu_ps(xt + i), accv);
+                float v[8]; _mm256_storeu_ps(v, accv);
+                acc += v[0] + v[1] + v[2] + v[3] + v[4] + v[5] + v[6] + v[7];
+                for (; i < in; i++) acc += wi[i] * xt[i];
+                accv = _mm256_setzero_ps();
+                int jj = 0;
+                for (; jj + 8 <= h; jj += 8)
+                    accv = _mm256_fmadd_ps(_mm256_loadu_ps(wh + jj),
+                                           _mm256_loadu_ps(h_prev + jj), accv);
+                _mm256_storeu_ps(v, accv);
+                acc += v[0] + v[1] + v[2] + v[3] + v[4] + v[5] + v[6] + v[7];
+                for (; jj < h; jj++) acc += wh[jj] * h_prev[jj];
+                g[row] = acc;
+                continue;
+            }
+#endif
             for (int i = 0; i < in; i++) acc += wi[i] * xt[i];
             for (int j = 0; j < h; j++) acc += wh[j] * h_prev[j];
             g[row] = acc;

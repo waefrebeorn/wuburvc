@@ -595,11 +595,32 @@ int wubu_rmvpe_f0(WuBuRmvpe *r, const float *pcm, int n_samples,
             if (df) { fwrite(gru_out, sizeof(float), (size_t)H * 512, df); fclose(df); }
         }
 
-        /* Linear(512->360) + sigmoid -> (H, 360) */
+        /* Linear(512->360) + sigmoid -> (H, 360).
+         * AVX2: 512-dim dot is contiguous; 8 lanes accumulate j-groups with
+         * the SAME sequential order as scalar (lane 0 = j0..j7, etc.), so
+         * only the FMA-vs-mul+add 1ulp remains — speed mode accepts it
+         * (quality mode keeps the scalar path byte-identical). */
         const float *fw = tdata(r, "fc.1.weight");
         const float *fb = tdata(r, "fc.1.bias");
         for (int t = 0; t < H; t++) {
             const float *gt = gru_out + (size_t)t * 512;
+#if defined(__AVX2__) && defined(__FMA__)
+            if (wubu_get_fast_math()) {
+                for (int k = 0; k < 360; k++) {
+                    const float *wrow = fw + (size_t)k * 512;
+                    __m256 accv = _mm256_setzero_ps();
+                    int j = 0;
+                    for (; j + 8 <= 512; j += 8)
+                        accv = _mm256_fmadd_ps(_mm256_loadu_ps(wrow + j),
+                                               _mm256_loadu_ps(gt + j), accv);
+                    float v[8]; _mm256_storeu_ps(v, accv);
+                    float acc = fb[k] + v[0] + v[1] + v[2] + v[3] + v[4] + v[5] + v[6] + v[7];
+                    for (; j < 512; j++) acc += wrow[j] * gt[j];
+                    gru_out[(size_t)t * 360 + k] = 1.0f / (1.0f + expf(-acc));  /* F0 head: keep libm sigmoid */
+                }
+                continue;
+            }
+#endif
             for (int k = 0; k < 360; k++) {
                 const float *wrow = fw + (size_t)k * 512;
                 float acc = fb[k];

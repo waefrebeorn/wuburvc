@@ -629,8 +629,15 @@ int wubu_rvc_retrieve_blend(const WuBuRVCModel *model,
     if (!model || !content_feats || !out || n_frames < 1) return -1;
     /* Top-k retrieval (if index loaded) — REAL FAISS search against the
      * training-set vectors. No self-blend: if no index is loaded, retrieval
-     * is skipped entirely (ratio 0), never the query blended with itself. */
-    int k = 1; /* only the top-1 neighbor is used by the blend below */
+     * is skipped entirely (ratio 0), never the query blended with itself.
+     * k=8 matches the ORIGINAL RVC pipeline.py:
+     *   score, ix = index.search(npy, k=8)
+     *   weight = np.square(1/score); weight /= weight.sum(axis=1, keepdims=True)
+     *   npy = np.sum(index_vectors[ix] * weight[...,None], axis=1)
+     *   feats = npy * index_rate + (1 - index_rate) * feats
+     * k=1 (older code) was simpler but NOT what the reference does — the
+     * weighted 8-neighbor average is smoother and closer to training data. */
+    const int k = 8;
     int *retrieved_idx = (int *)calloc((size_t)k * n_frames, sizeof(int));
     float *retrieved_dist = (float *)calloc((size_t)k * n_frames, sizeof(float));
     int have_retrieval = 0;
@@ -659,14 +666,28 @@ int wubu_rvc_retrieve_blend(const WuBuRVCModel *model,
      * training-set neighbors. Without an index, ratio drops to 0. */
     float retrieval_ratio = have_retrieval ? index_rate : 0.0f;
     for (int f = 0; f < n_frames; f++) {
+        /* squared-inverse-distance weights over the k neighbors */
+        float wsum = 0.0f;
+        float w[8];
+        int valid[8] = {0,0,0,0,0,0,0,0};
+        for (int i = 0; i < k; i++) {
+            int rid = retrieved_idx[(size_t)f * k + i];
+            if (have_retrieval && rid >= 0 && rid < model->n_index_vectors) {
+                float d = retrieved_dist[(size_t)f * k + i];
+                float wv = 1.0f / (d * d + 1e-12f);
+                w[i] = wv; wsum += wv; valid[i] = 1;
+            }
+        }
+        if (wsum <= 0.0f) wsum = 1.0f;
         for (int d = 0; d < content_dim; d++) {
             float orig = content_feats[(size_t)f * content_dim + d];
-            float retr = orig;
-            if (have_retrieval && retrieved_idx[(size_t)f * k] >= 0) {
-                int rid = retrieved_idx[(size_t)f * k];
-                if (rid >= 0 && rid < model->n_index_vectors)
-                    retr = model->retrieval_vectors[(size_t)rid * content_dim + d];
+            float retr = 0.0f;
+            for (int i = 0; i < k; i++) {
+                if (!valid[i]) continue;
+                int rid = retrieved_idx[(size_t)f * k + i];
+                retr += (w[i] / wsum) * model->retrieval_vectors[(size_t)rid * content_dim + d];
             }
+            if (!have_retrieval) retr = orig;
             out[(size_t)f * content_dim + d] =
                 orig * (1.0f - retrieval_ratio) + retr * retrieval_ratio;
         }

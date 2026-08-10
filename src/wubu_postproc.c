@@ -74,6 +74,21 @@ static void biquad_peaking(BiQuad *bq, float fc, float sr, float gain_db, float 
     bq->x1 = bq->x2 = bq->y1 = bq->y2 = 0;
 }
 
+static void biquad_highpass(BiQuad *bq, float fc, float sr, float Q) {
+    float omega = 2.0f * (float)M_PI * fc / sr;
+    float sinw = sinf(omega), cosw = cosf(omega);
+    float alpha = sinw / (2 * Q);
+    float b0 = (1 + cosw) / 2;
+    float b1 = -(1 + cosw);
+    float b2 = (1 + cosw) / 2;
+    float a0 = 1 + alpha;
+    float a1 = -2 * cosw;
+    float a2 = 1 - alpha;
+    bq->b0 = b0 / a0; bq->b1 = b1 / a0; bq->b2 = b2 / a0;
+    bq->a1 = a1 / a0; bq->a2 = a2 / a0;
+    bq->x1 = bq->x2 = bq->y1 = bq->y2 = 0;
+}
+
 void wubu_post_process(const float *input, float *output, int n, int sr,
                         const WuBuPostProcOpts *opts) {
     if (!input || !output || n <= 0) return;
@@ -99,21 +114,30 @@ void wubu_post_process(const float *input, float *output, int n, int sr,
             output[i] = biquad_process(&bq, output[i]);
     }
 
-    /* De-essing: dynamic attenuation of high frequencies during sibilance */
+    /* De-essing: split-band dynamic sibilance reduction at 5-10kHz.
+     * Proper implementation: high-pass the 5kHz band, follow its energy
+     * envelope (fast attack ~2ms, slow release ~80ms), and attenuate ONLY
+     * that band when sibilance crosses threshold. The old one-pole HPF at
+     * alpha=0.05 was a ~400Hz broadband detector — it barely moved. */
     if (opts->de_ess_strength > 0.0f) {
-        float alpha = 0.05f;
-        float prev_sample = 0;
-        float hpf_prev = 0;
+        float fc = 5000.0f;                       /* sibilance band edge */
+        float Q = 0.7071f;
+        float attack = 1.0f - expf(-1.0f / (0.002f * (float)sr));   /* 2 ms */
+        float release = 1.0f - expf(-1.0f / (0.080f * (float)sr));  /* 80 ms */
+        BiQuad hp; biquad_init(&hp);
+        biquad_highpass(&hp, fc, (float)sr, Q);
+        float env = 0.0f;
         for (int i = 0; i < n; i++) {
-            float hpf = alpha * (output[i] - prev_sample) + (1.0f - alpha) * hpf_prev;
-            hpf_prev = hpf;
-            prev_sample = output[i];
-            float energy = fabsf(hpf);
-            if (energy > opts->de_ess_threshold) {
-                float reduction = 1.0f - opts->de_ess_strength * 0.5f *
-                                  (energy - opts->de_ess_threshold) / (energy + 0.01f);
-                if (reduction < 0.5f) reduction = 0.5f;
-                output[i] *= reduction;
+            float s = biquad_process(&hp, output[i]);
+            float e = fabsf(s);
+            env = (e > env) ? env + attack * (e - env)
+                            : env + release * (e - env);
+            if (env > opts->de_ess_threshold) {
+                float over = (env - opts->de_ess_threshold) / (env + 1e-6f);
+                /* reduction ramps 1.0 → (1 - strength) as sibilance peaks */
+                float att = 1.0f - opts->de_ess_strength * over;
+                if (att < 0.5f) att = 0.5f;
+                output[i] -= s * (1.0f - att);   /* remove part of the HF band */
             }
         }
     }

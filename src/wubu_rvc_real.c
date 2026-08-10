@@ -1536,7 +1536,12 @@ int wubu_generator_nsf(WuBuRVCModel *model,
              * (0.0333 Gaussian) carries the frication. */
             if (uv_mask) {
                 float uvj = uv_mask[fi];
-                sv = (uvj > 0.5f) ? 1.0f : 0.0f;
+                /* Confidence-graded voicing (Triple-DA detection fix):
+                 * uv_mask is now 0..1 (HNR+flatness confidence, temporal-
+                 * smoothed), NOT binary. Use it directly as the sine/noise
+                 * blend so breathy onsets cross-fade instead of clicking.
+                 * Clamp tiny values to exact 0 for parity with hard cases. */
+                sv = (uvj > 0.02f) ? uvj : 0.0f;
             }
             /* Phase 4 improvement: noise injection in NSF sine generation.
              * PyTorch SineGen (models.py:340) adds Gaussian noise to BOTH:

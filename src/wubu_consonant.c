@@ -73,28 +73,70 @@ int wubu_consonant_uv(const float *pcm, int n_samples, int sr,
         for (int i = 0; i < window; i++) e += x[i] * x[i];
         float rms = (float)sqrt(e / (double)window);
 
-        /* voicing decision:
-         *   - f0 says voiced AND spectrum peaked  -> voiced
-         *   - flat spectrum (noise-like)          -> unvoiced/consonant
-         *   - very quiet frame                    -> unvoiced (breath/stop)
-         * Threshold: flatness > 0.6 is clearly noise-like; < 0.35 clearly
-         * harmonic. In between, trust f0 if present. */
+        /* HNR (harmonics-to-noise ratio) — the SOTA voicing confidence
+         * (SwiftF0 confidence, FCPE voicing). Sum spectral energy at
+         * f0, 2×f0, 3×f0 (harmonics) vs total energy. High HNR = clear
+         * periodic source; low HNR = noise/fricative/breath. This is
+         * the missing detection signal: flatness alone can't tell a
+         * breathy voiced frame from a fricative. */
+        float hnr = 0.0f;
+        if (f0 && f0[fi] > 40.0f) {
+            double harm_e = 0.0, tot_e = 1e-9;
+            for (int b = 1; b < nbins; b++) {
+                float m = sqrtf(spec[b].re * spec[b].re + spec[b].im * spec[b].im);
+                tot_e += (double)m * m;
+            }
+            float f0_bin = f0[fi] * (float)nfft / (float)sr;
+            for (int h = 1; h <= 8; h++) {
+                int b = (int)(f0_bin * h + 0.5f);
+                if (b < 1 || b >= nbins) break;
+                float m = sqrtf(spec[b].re * spec[b].re + spec[b].im * spec[b].im);
+                harm_e += (double)m * m;
+            }
+            hnr = (float)(harm_e / tot_e);   /* 0..~1 (1 = pure harmonic) */
+        }
+
+        /* voicing decision — now CONFIDENCE-GRADED, not hard binary:
+         *   f0 present + strong harmonics (hnr) -> confidently voiced
+         *   flat spectrum, no harmonic energy     -> unvoiced
+         *   in between -> soft confidence (graded sine/noise blend)
+         * f0 presence is necessary but not sufficient: a breathy frame
+         * with weak harmonics is marked PARTIAL so the generator blends
+         * sine + noise instead of hard-switching (kills onset clicks). */
         int f0_voiced = (f0 && f0[fi] > 0.0f);
         float uv;
-        if (flatness > 0.65f) {
-            uv = 0.0f;                       /* flat noise -> unvoiced */
-        } else if (flatness < 0.35f) {
-            uv = 1.0f;                       /* peaked harmonics -> voiced */
-        } else if (f0_voiced && flatness < 0.55f) {
-            uv = 1.0f;                       /* f0 + moderate peak -> voiced */
+        if (!f0_voiced || flatness > 0.65f) {
+            uv = 0.0f;                       /* no pitch or flat noise */
+        } else if (flatness < 0.35f && hnr > 0.5f) {
+            uv = 1.0f;                       /* peaked harmonics + strong HNR */
         } else {
-            uv = 0.0f;
+            /* graded: blend by harmonic strength (0.3..1.0) */
+            uv = 0.3f + 0.7f * (hnr > 0.5f ? 1.0f : (hnr / 0.5f));
+            if (flatness > 0.45f) uv *= 0.6f;   /* flat-ish pulls toward noise */
+            if (uv > 1.0f) uv = 1.0f;
+            if (uv < 0.05f) uv = 0.0f;
         }
         /* very quiet frames: treat as unvoiced (plosive gap, breath) */
         if (rms < 0.01f) uv = 0.0f;
 
         uv_out[fi] = uv;
         if (flat_out) flat_out[fi] = flatness;
+    }
+
+    /* temporal smoothing: a 3-frame median on the confidence kills
+     * single-frame flicker (breathy onsets flip 0/1 spuriously). */
+    if (n_frames >= 3) {
+        float *tmp = (float *)malloc((size_t)n_frames * sizeof(float));
+        if (tmp) {
+            memcpy(tmp, uv_out, (size_t)n_frames * sizeof(float));
+            for (int i = 1; i < n_frames - 1; i++) {
+                float a = tmp[i - 1], b = tmp[i], c = tmp[i + 1];
+                float med = (a <= b) ? ((b <= c) ? b : (a > c ? a : c))
+                                     : ((a <= c) ? a : (b > c ? b : c));
+                uv_out[i] = 0.5f * uv_out[i] + 0.5f * med;
+            }
+            free(tmp);
+        }
     }
 
     free(spec); free(hann);

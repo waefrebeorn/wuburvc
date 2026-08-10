@@ -212,14 +212,19 @@ int wubu_harmony_detect(const float *pcm, int n_samples, int sr,
         }
         qsort(top, (size_t)ntop, sizeof(WubuHarmCand), cmp_cand_desc);
 
-        /* pick the lead: global salience max, refined toward the input
-         * contour (RMVPE) when it agrees within ~1 semitone — RMVPE is
-         * far more accurate on monophonic frames than our 36-grid spectral
-         * pick (which can land a grid step flat when adjacent points map
-         * to the same FFT bin). The continuity bonus already stabilizes
-         * note-flipping; this refinement nails the exact cents. */
+        /* pick the lead: the INPUT f0 contour (RMVPE/YIN) is the monophonic
+         * authority — it is far more accurate than a spectral harmonic-sum
+         * argmax, which routinely flips OCTAVES (the 2nd partial of a strong
+         * fundamental can out-peak the fundamental → lead jumps ±1200 cents
+         * = the "single singer double octave swap" the listener hears).
+         * So when the input is voiced, the lead IS the input contour,
+         * UNCONDITIONALLY — never let the spectral pick override it.
+         * The spectral salience map is used ONLY to find the harmony. */
         float lead = 0.0f, harm = 0.0f, gain = 0.0f;
-        if (ntop >= 1 && top[0].sal > 1e-6f) {
+        if (primary_in && primary_in[fi] > 40.0f) {
+            lead = primary_in[fi];
+        } else if (ntop >= 1 && top[0].sal > 1e-6f) {
+            /* unvoiced input: fall back to the spectral pick (rare) */
             lead = top[0].freq;
             if (primary_in && primary_in[fi] > 0.0f) {
                 float cents = 1200.0f * fabsf(log2f(primary_in[fi] / lead));

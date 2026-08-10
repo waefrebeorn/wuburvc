@@ -1295,7 +1295,8 @@ int wubu_generator_nsf(WuBuRVCModel *model,
                        const float *nsff0, const float *g,
                        float *out, int max_samples,
                        int inject_noise,
-                       int use_snake)  /* BigVGAN Snake activation in MRF blocks */
+                       int use_snake,
+                       const float *harmony_f0, const float *harmony_gain)  /* BigVGAN Snake activation in MRF blocks */
 {
     const int profiling = getenv("WUBU_TIME_STAGES") != NULL;
     double t_convT = 0.0, t_mrf = 0.0, t_noise = 0.0, t_other = 0.0;
@@ -1403,8 +1404,14 @@ int wubu_generator_nsf(WuBuRVCModel *model,
      *   rad += pad(rad_acc)                        # rad[t] += carry[t-1]
      *   sine = sin(2*pi * rad)                     # rad IS the phase (no cumsum)
      *
-     * Then: sine_waves *= uv  (noise=0, deterministic parity)
-     *       har = tanh(l_linear(sine_waves))
+     * HARMONY: when harmony_f0 is present, a SECOND sine at the harmony
+     * fundamental is generated with the same phase-carry math and added
+     * (weighted by harmony_gain) so the excitation is polyphonic. The
+     * generator's learned resblocks then render both tones — the model was
+     * trained on the full harmonic structure, so injecting the second
+     * fundamental into the source lets it synthesize the harmony without
+     * retraining. Only frames with harmony_f0>0 are affected; the phase
+     * accumulator runs continuously so notes don't click.
      */
     const RVCTensor *lin_w = T(model, "dec.m_source.l_linear.weight");
     const RVCTensor *lin_b = T(model, "dec.m_source.l_linear.bias");
@@ -1419,25 +1426,40 @@ int wubu_generator_nsf(WuBuRVCModel *model,
 
         /* Step 1: rad = f0/sr per frame (NOT *arange(1,upp+1) yet) */
         float *rad = (float *)malloc((size_t)nF * sizeof(float));
-        if (!rad) { free(sine); free(x); return -1; }
+        float *hrad = harmony_f0 ? (float *)malloc((size_t)nF * sizeof(float)) : NULL;
+        if (!rad || (harmony_f0 && !hrad)) {
+            free(hrad); free(rad); free(sine); free(x); return -1;
+        }
         for (int j = 0; j < nF; j++) {
             float f0 = nsff0[j];
             rad[j] = (f0 > 0 ? f0 : 0.0f) / (float)sr;
+            if (hrad) {
+                float hf = (harmony_f0[j] > 0.0f) ? harmony_f0[j] : 0.0f;
+                hrad[j] = hf / (float)sr;
+            }
         }
 
         /* Step 2: carry[t] = fmod(rad[t]*upp + 0.5, 1.0) - 0.5
          *         rad_acc[t] = fmod(sum(carry[0..t]), 1.0) */
         float *carry = (float *)malloc((size_t)nF * sizeof(float));
         float *rad_acc = (float *)malloc((size_t)nF * sizeof(float));
-        if (!carry || !rad_acc) {
-            free(carry); free(rad_acc); free(rad); free(sine); free(x); return -1;
+        float *hcarry = hrad ? (float *)malloc((size_t)nF * sizeof(float)) : NULL;
+        float *hrad_acc = hrad ? (float *)malloc((size_t)nF * sizeof(float)) : NULL;
+        if (!carry || !rad_acc || (hrad && (!hcarry || !hrad_acc))) {
+            free(hrad_acc); free(hcarry); free(carry); free(rad_acc); free(hrad); free(rad); free(sine); free(x); return -1;
         }
-        float accum = 0.0f;
+        float accum = 0.0f, haccum = 0.0f;
         for (int t = 0; t < nF; t++) {
             carry[t] = rad[t] * (float)ups_total;
             float rad2 = fmodf(carry[t] + 0.5f, 1.0f) - 0.5f;
             accum += rad2;
             rad_acc[t] = fmodf(accum, 1.0f);  /* cumulative carry, mod 1 */
+            if (hrad) {
+                hcarry[t] = hrad[t] * (float)ups_total;
+                float hrad2 = fmodf(hcarry[t] + 0.5f, 1.0f) - 0.5f;
+                haccum += hrad2;
+                hrad_acc[t] = fmodf(haccum, 1.0f);
+            }
         }
 
         /* Step 3: sine[j] = sin(2*pi * (rad[frame]*(u+1) + carry_prev)) * 0.1 * uv
@@ -1451,6 +1473,20 @@ int wubu_generator_nsf(WuBuRVCModel *model,
             int u = j % ups_total;   /* sample index within frame: 0..upp-1 */
             float phase = rad[fi] * (float)(u + 1);  /* f0/sr * (u+1) */
             if (fi > 0) phase += rad_acc[fi - 1];     /* add carry from prev frame */
+            /* Harmony: second sine at the harmony fundamental with its own
+             * phase-carry, blended by harmony_gain. Rendered even on
+             * frames the lead labels unvoiced — the harmony carries the
+             * polyphony the lead detector couldn't follow. */
+            float harm_phase = 0.0f;
+            float hg = 0.0f;
+            if (hrad && harmony_f0 && harmony_gain &&
+                harmony_f0[fi] > 0.0f) {
+                harm_phase = hrad[fi] * (float)(u + 1);
+                if (fi > 0) harm_phase += hrad_acc[fi - 1];
+                hg = harmony_gain[fi];
+                if (hg < 0.0f) hg = 0.0f;
+                if (hg > 1.0f) hg = 1.0f;
+            }
             /* Gate the sin/tanh on fast-math like every other stage: in
              * default mode (fast_math=0) the sine must be libm sinf/tanhf
              * so CPU == VK == PyTorch reference. The un-gated folded poly
@@ -1458,6 +1494,14 @@ int wubu_generator_nsf(WuBuRVCModel *model,
              * instead of 1.0). */
             float s = (wubu_get_fast_math() ? wubu_sinf_folded(2.0f * (float)M_PI * phase)
                                             : sinf(2.0f * (float)M_PI * phase)) * 0.1f;  /* sine_amp = 0.1 */
+            if (hg > 0.0f) {
+                float hs = (wubu_get_fast_math() ? wubu_sinf_folded(2.0f * (float)M_PI * harm_phase)
+                                                 : sinf(2.0f * (float)M_PI * harm_phase)) * 0.1f;
+                /* blend the harmony at hg of the lead's amplitude; the
+                 * sum stays in [-0.2, 0.2] pre-tanh so l_linear + tanh
+                 * handles it like a louder source */
+                s += hs * hg;
+            }
             float sv = (nsff0[fi] > 0) ? 1.0f : 0.0f;  /* uv mask */
             /* Phase 4 improvement: noise injection in NSF sine generation.
              * PyTorch SineGen (models.py:340) adds Gaussian noise to BOTH:
@@ -1483,6 +1527,7 @@ int wubu_generator_nsf(WuBuRVCModel *model,
                                             : tanhf(linw * sw + linb));  /* l_linear + tanh */
         }
         free(carry); free(rad_acc); free(rad);
+        free(hcarry); free(hrad_acc); free(hrad);
     }
     if (getenv("WUBU_RVC_DUMP")) {
         fprintf(stderr, "[dump] about to write c_gen_sine.npy (%d samples) nF=%d ups_total=%d f0[0]=%.3f f0[1]=%.3f f0[nF-1]=%.3f\n",
@@ -1797,7 +1842,8 @@ int wubu_rvc_synthesize_real(WuBuRVCModel *model,
                              const int *f0_coarse, const float *nsff0,
                              int sid, float randn_scale,
                              float *out_audio, int max_samples,
-                             int use_snake) {  /* BigVGAN Snake activation */
+                             int use_snake,
+                             const float *harmony_f0, const float *harmony_gain) {
     if (!model || !content || !out_audio || n_frames < 1) return -1;
 
     const RVCTensor *emb_g = T(model, "emb_g.weight");
@@ -1882,7 +1928,8 @@ int wubu_rvc_synthesize_real(WuBuRVCModel *model,
     /* Snake activation naturally expands the signal; the damped snake_c
      * function (0.1 * sin^2 term) compensates for this. */
     int n_out = wubu_generator_nsf(model, z, n_frames, inter, nsff0, g,
-                                   out_audio, max_samples, randn_scale > 0.0f, use_snake);
+                                   out_audio, max_samples, randn_scale > 0.0f, use_snake,
+                                   harmony_f0, harmony_gain);
 
     free(m); free(logs); free(x_mask); free(z_p); free(z);
     return n_out;

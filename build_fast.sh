@@ -14,6 +14,7 @@ RVC_SRCS="src/wubu_rvc.c src/wubu_rvc_parity.c src/wubu_rvc_weights.c \
           src/wubu_rvc_kernels_exact.c src/wubu_rvc_real.c src/wubu_rvc_hubert.c \
           src/wubu_rvc_f0.c src/wubu_postproc.c src/wubu_rmvpe.c \
           src/wubu_stft.c src/wubu_gru.c src/wubu_audioio.c \
+          src/wubu_harmony.c \
           src/wubu_pitch.c src/wubu_autokey.c src/wubu_fft.c src/wubu_math.c src/wubu_vk.c \
           src/wubu_train.c src/wubu_train_vk.c"
 "$GCC" -std=c11 -O3 -fopenmp -pthread -I src $ARCH \

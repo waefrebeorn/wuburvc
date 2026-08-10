@@ -126,7 +126,8 @@ float wubu_autokey_calibrate(WuBuRVCModel *model, WuBuHubert *hb,
         if (!pout) { free(cmaj); free(pf0); free(pcoarse); free(pnsf); break; }
         int pn = wubu_rvc_synthesize_real(model, cmaj, pf, content_dim,
                                           pcoarse, pnsf, 0, noise_scale,
-                                          pout, pT2 * ups_total + 1024, use_snake);
+                                          pout, pT2 * ups_total + 1024, use_snake,
+                                          NULL, NULL);
         free(cmaj); free(pf0); free(pcoarse); free(pnsf);
         if (pn <= 0) { free(pout); break; }
 

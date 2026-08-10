@@ -43,6 +43,7 @@
 #include <immintrin.h>
 #include <dirent.h>
 #include "wubu_postproc.h"
+#include "wubu_harmony.h"
 
 static void die(const char *msg) { fprintf(stderr, "wubu_rvc_cli: %s\n", msg); exit(1); }
 
@@ -158,6 +159,7 @@ static float *upsample_frames(const float *in, int T, int dim, int *T2_out) {
 typedef struct {
     const float *pcm16; int n16;
     const int *f0_coarse; const float *nsff0; int n_f0;
+    const float *harmony_f0; const float *harmony_gain; int n_harmony;
     const WuBuHubert *hb; int rvc_ver; int content_dim;
     WuBuRVCModel *model; int speaker_id; float noise_scale; int use_snake;
     int ups_total;
@@ -270,7 +272,13 @@ static void *chunk_worker(void *arg) {
                                              ctx->f0_coarse + f0_start,
                                              ctx->nsff0 + f0_start,
                                              ctx->speaker_id, ctx->noise_scale,
-                                             aout, max_a, ctx->use_snake);
+                                             aout, max_a, ctx->use_snake,
+                                             (ctx->harmony_f0 && ctx->harmony_gain &&
+                                              f0_start < ctx->n_harmony)
+                                                 ? ctx->harmony_f0 + f0_start : NULL,
+                                             (ctx->harmony_f0 && ctx->harmony_gain &&
+                                              f0_start < ctx->n_harmony)
+                                                 ? ctx->harmony_gain + f0_start : NULL);
         free(cmaj);
         if (n_out <= 0) { free(aout); ctx->rc[c] = -1; continue; }
         ctx->audio[c] = aout;
@@ -337,6 +345,7 @@ int main(int argc, char **argv) {
     float rms_mix = 0.25f;    /* --rmsmix F: output follows input volume envelope (RVC default 0.25) */
     float index_rate = 0.78f; /* --index-rate R: FAISS retrieval blend (RVC default 0.78) */
     float protect = 0.33f;    /* --protect P: voiceless-consonant protection (RVC default 0.33) */
+    int harmony = 1;          /* --harmony 0/1: dual-fundamental detection + sine injection */
     int autokey_probe = 0;    /* --autokey N: auto key adaptation (N = probe secs) */
     float chunk_secs = 3.0f;  /* --chunk F: chunked inference (3s default; 0 = whole-track) */
     float ctx_secs = 0.72f;   /* --ctx F: HuBERT context window in seconds
@@ -403,6 +412,9 @@ int main(int argc, char **argv) {
             protect = (float)atof(argv[a + 1]);
             if (protect < 0.0f) protect = 0.0f;
             if (protect > 0.5f) protect = 0.5f;   /* RVC caps at 0.5 */
+            a++;
+        } else if (strcmp(argv[a], "--harmony") == 0) {
+            harmony = atoi(argv[a + 1]);
             a++;
         } else if (strcmp(argv[a], "--autokey") == 0) {
             autokey_probe = atoi(argv[a + 1]);
@@ -774,6 +786,33 @@ int main(int argc, char **argv) {
     }
     free(f0);
 
+    /* 5c. harmony detection — dual fundamental (polyphonic) pitch.
+     * Runs on the 16k PCM with the f0 contour as the continuity anchor.
+     * Produces per-frame harmony_f0[] (Hz, 0 = monophonic) + gain[] used
+     * by the generator's sine excitation to render both tones. */
+    float *harmony_f0 = NULL, *harmony_gain = NULL;
+    int n_harmony = 0;
+    if (harmony && n_f0_2 > 0) {
+        harmony_f0 = (float *)calloc((size_t)(n_f0_2 + 2), sizeof(float));
+        harmony_gain = (float *)calloc((size_t)(n_f0_2 + 2), sizeof(float));
+        if (harmony_f0 && harmony_gain) {
+            t0 = clock();
+            int hg = wubu_harmony_detect(pcm16, n16, 16000, nsff0, n_f0_2,
+                                         NULL, harmony_f0, harmony_gain,
+                                         n_f0_2, 1024, 160, 50.0f, 1100.0f);
+            n_harmony = hg;
+            if (hg > 0) {
+                int hc = 0; double hs = 0;
+                for (int j = 0; j < hg; j++) if (harmony_f0[j] > 0) { hc++; hs += harmony_f0[j]; }
+                printf("[5c] harmony: %d/%d frames dual-fundamental (avg %.1f Hz), %.2f s\n",
+                       hc, hg, hc ? hs / hc : 0.0,
+                       (double)(clock() - t0) / CLOCKS_PER_SEC);
+            } else {
+                printf("[5c] harmony: detector returned %d (disabled)\n", hg);
+            }
+        }
+    }
+
     /* 6. real synth */
     float *out_audio = NULL;
     int n_out = 0;
@@ -799,6 +838,7 @@ int main(int argc, char **argv) {
         memset(&ctx, 0, sizeof(ctx));
         ctx.pcm16 = pcm16; ctx.n16 = n16;
         ctx.f0_coarse = f0_coarse; ctx.nsff0 = nsff0; ctx.n_f0 = n_f0_2;
+        ctx.harmony_f0 = harmony_f0; ctx.harmony_gain = harmony_gain; ctx.n_harmony = n_harmony;
         ctx.hb = &hb; ctx.rvc_ver = rvc_ver; ctx.content_dim = content_dim;
         ctx.model = rvc->model; ctx.speaker_id = speaker_id;
         ctx.noise_scale = noise_scale; ctx.use_snake = use_snake;
@@ -912,7 +952,8 @@ int main(int argc, char **argv) {
     t0 = clock();
     n_out = wubu_rvc_synthesize_real(rvc->model, cmaj, n_frames, content_dim,
                                      f0_coarse, nsff0, speaker_id, noise_scale,
-                                     out_audio, max_audio, use_snake);
+                                     out_audio, max_audio, use_snake,
+                                     harmony_f0, harmony_gain);
     synth_s = (double)(clock() - t0) / CLOCKS_PER_SEC;
     if (n_out <= 0) die("synth failed");
 
@@ -933,7 +974,8 @@ int main(int argc, char **argv) {
         t0 = clock();
         n_out = wubu_rvc_synthesize_real(rvc->model, cmaj, n_frames, content_dim,
                                          f0_coarse, nsff0, speaker_id, noise_scale,
-                                         out_audio, max_audio, use_snake);
+                                         out_audio, max_audio, use_snake,
+                                         harmony_f0, harmony_gain);
         synth_s = (double)(clock() - t0) / CLOCKS_PER_SEC;
         if (n_out <= 0) die("synth failed (LeakyReLU fallback)");
     }
@@ -1044,6 +1086,7 @@ int main(int argc, char **argv) {
            (double)n_out / sr_out);
 
     free(pcm16); free(f0_coarse); free(nsff0); free(out_audio);
+    free(harmony_f0); free(harmony_gain);
     free(audio);
     wubu_hubert_free(&hb);
     wubu_rvc_destroy(rvc);

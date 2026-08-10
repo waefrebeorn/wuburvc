@@ -1297,7 +1297,7 @@ int wubu_generator_nsf(WuBuRVCModel *model,
                        int inject_noise,
                        int use_snake,
                        const float *harmony_f0, const float *harmony_gain,
-                       const float *uv_mask)  /* BigVGAN Snake activation in MRF blocks */
+                       const float *uv_mask, const float *breath_gain)  /* BigVGAN Snake activation in MRF blocks */
 {
     const int profiling = getenv("WUBU_TIME_STAGES") != NULL;
     double t_convT = 0.0, t_mrf = 0.0, t_noise = 0.0, t_other = 0.0;
@@ -1528,6 +1528,30 @@ int wubu_generator_nsf(WuBuRVCModel *model,
              * 0.0333 Gaussian breath texture. For parity mode
              * (randn_scale=0 / inject_noise=0) noise is suppressed. */
             float noise_amp = inject_noise ? (sv * 0.003f + (1.0f - sv) * 0.1f / 3.0f) : 0.0f;
+            /* Breath realism gate (wubu_breath, knowledge/BREATH_REALISM_RESEARCH.md):
+             * RVC training drops breaths (issue #65) so the model renders
+             * nothing where the source inhales; the flatness uv mask fires
+             * the noise branch on SILENCE (phantom breath). breath_gain
+             * fixes both:
+             *   breath frame   (gain=1): noise_amp ×3 → real inhalation
+             *   silence frame  (gain=0): noise_amp → 0   → no phantom
+             *   consonant/voiced (gain between, or no mask): unchanged */
+            if (breath_gain) {
+                float bg = breath_gain[fi];
+                if (bg > 0.5f) {
+                    /* breath frame: boost noise to render the inhalation
+                     * the model never learned (RVC training drops breaths) */
+                    noise_amp = (sv * 0.003f + (1.0f - sv) * 0.1f / 3.0f)
+                                * (1.0f + bg * 2.0f);
+                } else if (bg > 0.05f) {
+                    /* consonant/voiced: leave legacy noise unchanged */
+                } else {
+                    /* silence frame (gain ≈ 0): kill the phantom breath —
+                     * the flatness uv mask would otherwise synthesize noise
+                     * on silence */
+                    noise_amp = 0.0f;
+                }
+            }
             /* Gaussian via Irwin-Hall (sum of 12 U(-1,1)) — matches the
              * z_p noise; torch.randn is N(0,1) not uniform. */
             float g = 0.0f;
@@ -1858,7 +1882,7 @@ int wubu_rvc_synthesize_real(WuBuRVCModel *model,
                              float *out_audio, int max_samples,
                              int use_snake,
                              const float *harmony_f0, const float *harmony_gain,
-                             const float *uv_mask) {
+                             const float *uv_mask, const float *breath_gain) {
     if (!model || !content || !out_audio || n_frames < 1) return -1;
 
     const RVCTensor *emb_g = T(model, "emb_g.weight");
@@ -1944,7 +1968,7 @@ int wubu_rvc_synthesize_real(WuBuRVCModel *model,
      * function (0.1 * sin^2 term) compensates for this. */
     int n_out = wubu_generator_nsf(model, z, n_frames, inter, nsff0, g,
                                    out_audio, max_samples, randn_scale > 0.0f, use_snake,
-                                   harmony_f0, harmony_gain, uv_mask);
+                                   harmony_f0, harmony_gain, uv_mask, breath_gain);
 
     free(m); free(logs); free(x_mask); free(z_p); free(z);
     return n_out;

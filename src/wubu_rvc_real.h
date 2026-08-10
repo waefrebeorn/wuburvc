@@ -66,7 +66,7 @@ int wubu_rvc_synthesize_real(WuBuRVCModel *model,
                              float *out_audio, int max_samples,
                              int use_snake,
                              const float *harmony_f0, const float *harmony_gain,
-                             const float *uv_mask);
+                             const float *uv_mask, const float *breath_gain);
 
 /* GPU generator variant (wubu_rvc_cuda.cu): flow on CPU, GeneratorNSF on CUDA. */
 int wubu_rvc_synthesize_real_cuda(WuBuRVCModel *model,
@@ -118,7 +118,12 @@ int wubu_flow_reverse(WuBuRVCModel *model,
  * from spectral flatness (wubu_consonant_uv). When present, unvoiced frames
  * get NOISE excitation (sine gated off, breath/frication noise on) instead
  * of the interpolated-pitch sine — the source-filter SOTA fix for mixed-up
- * consonants. Pass NULL to derive uv from nsff0>0 (legacy behavior). */
+ * consonants. Pass NULL to derive uv from nsff0>0 (legacy behavior).
+ * breath_gain: optional per-frame 0..2 breath-noise gain (wubu_breath).
+ * On breath frames noise_amp is scaled by breath_gain×2 (renders the
+ * inhalation the model never learned because RVC training drops breaths);
+ * on silence breath_gain=0 kills the phantom breath the flatness mask
+ * would otherwise synthesize. Pass NULL to keep legacy noise_amp. */
 int wubu_generator_nsf(WuBuRVCModel *model,
                        const float *z, int n_frames, int inter_channels,
                        const float *nsff0, const float *g,
@@ -126,7 +131,7 @@ int wubu_generator_nsf(WuBuRVCModel *model,
                        int inject_noise,
                        int use_snake,
                        const float *harmony_f0, const float *harmony_gain,
-                       const float *uv_mask);
+                       const float *uv_mask, const float *breath_gain);
 
 #ifdef __cplusplus
 }

@@ -45,6 +45,7 @@
 #include "wubu_postproc.h"
 #include "wubu_harmony.h"
 #include "wubu_consonant.h"
+#include "wubu_breath.h"
 
 static void die(const char *msg) { fprintf(stderr, "wubu_rvc_cli: %s\n", msg); exit(1); }
 
@@ -162,6 +163,7 @@ typedef struct {
     const int *f0_coarse; const float *nsff0; int n_f0;
     const float *harmony_f0; const float *harmony_gain; int n_harmony;
     const float *uv_mask; int n_uv;
+    const float *breath_gain; int n_breath;
     const WuBuHubert *hb; int rvc_ver; int content_dim;
     WuBuRVCModel *model; int speaker_id; float noise_scale; int use_snake;
     int ups_total;
@@ -282,7 +284,9 @@ static void *chunk_worker(void *arg) {
                                               f0_start < ctx->n_harmony)
                                                  ? ctx->harmony_gain + f0_start : NULL,
                                              (ctx->uv_mask && f0_start < ctx->n_uv)
-                                                 ? ctx->uv_mask + f0_start : NULL);
+                                                 ? ctx->uv_mask + f0_start : NULL,
+                                             (ctx->breath_gain && f0_start < ctx->n_breath)
+                                                 ? ctx->breath_gain + f0_start : NULL);
         free(cmaj);
         if (n_out <= 0) { free(aout); ctx->rc[c] = -1; continue; }
         ctx->audio[c] = aout;
@@ -351,6 +355,8 @@ int main(int argc, char **argv) {
     float protect = 0.33f;    /* --protect P: voiceless-consonant protection (RVC default 0.33) */
     int harmony = 1;          /* --harmony 0/1: dual-fundamental detection + sine injection */
     int consonant_uv = 1;     /* --consonant 0/1: spectral-flatness uv mask (noise excitation on unvoiced) */
+    int breath = 1;           /* --breath 0/1: breath-existence detection + noise gate/inject */
+    float breath_gain_scale = 1.0f; /* --breath-gain: multiplier for breath noise injection */
     int autokey_probe = 0;    /* --autokey N: auto key adaptation (N = probe secs) */
     float chunk_secs = 3.0f;  /* --chunk F: chunked inference (3s default; 0 = whole-track) */
     float ctx_secs = 0.72f;   /* --ctx F: HuBERT context window in seconds
@@ -423,6 +429,12 @@ int main(int argc, char **argv) {
             a++;
         } else if (strcmp(argv[a], "--consonant") == 0) {
             consonant_uv = atoi(argv[a + 1]);
+            a++;
+        } else if (strcmp(argv[a], "--breath") == 0) {
+            breath = atoi(argv[a + 1]);
+            a++;
+        } else if (strcmp(argv[a], "--breath-gain") == 0) {
+            breath_gain_scale = (float)atof(argv[a + 1]);
             a++;
         } else if (strcmp(argv[a], "--autokey") == 0) {
             autokey_probe = atoi(argv[a + 1]);
@@ -638,6 +650,7 @@ int main(int argc, char **argv) {
      *    f0_coarse.bin (int32 100fps) instead of YIN. */
     int n_f0 = 0;
     float *f0 = (float *)malloc((size_t)(n16 / 160 + 2) * sizeof(float));
+    float *f0_raw = NULL;   /* snapshot of raw (pre-interp) f0 for breath/voicing */
     int *f0_coarse = NULL;
     float *nsff0 = NULL;
     int n_f0_2 = 0;
@@ -654,6 +667,9 @@ int main(int argc, char **argv) {
         f0 = (float *)realloc(f0, (size_t)(n_f0 + 2) * sizeof(float));
         if (fread(f0, 4, (size_t)n_f0, ff) != (size_t)n_f0) die("f0ref read fail");
         fclose(ff);
+        /* snapshot raw f0 for breath/voicing (pre-interp) */
+        f0_raw = (float *)malloc((size_t)(n_f0 + 2) * sizeof(float));
+        if (f0_raw) memcpy(f0_raw, f0, (size_t)n_f0 * sizeof(float));
         f0_coarse = (int *)malloc((size_t)(n_f0 + 2) * sizeof(int));
         nsff0 = (float *)malloc((size_t)(n_f0 + 2) * sizeof(float));
         if (csz == (long)n_f0 * 4) {
@@ -693,6 +709,12 @@ int main(int argc, char **argv) {
          * noise_convs + the tiny uv*noise_std dither — NOT by zeroing the
          * sine. Leaving zeros here made the excitation drop out on unvoiced
          * frames = robotic consonants. */
+        /* Snapshot the RAW f0 (with unvoiced zeros) BEFORE interpolation —
+         * the breath detector and harmony anchor need the TRUE voicing
+         * boundary, not the interpolated contour (which is voiced everywhere
+         * and would hide real breath pauses). */
+        f0_raw = (float *)malloc((size_t)(n_f0 + 1) * sizeof(float));
+        if (f0_raw) memcpy(f0_raw, f0, (size_t)n_f0 * sizeof(float));
         {
             int *uv_idx = (int *)malloc((size_t)(n_f0 + 1) * sizeof(int));
             int *vo_idx = (int *)malloc((size_t)(n_f0 + 1) * sizeof(int));
@@ -818,6 +840,47 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* 5b3. breath-existence detection — where breathing actually is.
+     * Solves breathiness inconsistency (knowledge/BREATH_REALISM_RESEARCH.md):
+     * RVC training drops breaths so the model can't render them; the
+     * flatness uv mask fires the noise branch on silence (phantom breath).
+     * wubu_breath_detect classifies silence/breath/consonant/voiced per
+     * frame; breath_gain[] = 1 on breath frames (render inhalation),
+     * 0 on silence (kill phantom), ~0.3 elsewhere (leave consonant noise). */
+    float *breath_gain = NULL;
+    int n_breath = 0;
+    if (breath && n_f0_2 > 0) {
+        breath_gain = (float *)calloc((size_t)(n_f0_2 + 2), sizeof(float));
+        if (breath_gain) {
+            t0 = clock();
+            int *bcls = (int *)malloc((size_t)(n_f0_2 + 2) * sizeof(int));
+            WuBuBreathStats bst;
+            memset(&bst, 0, sizeof(bst));
+            int bg2 = 0;
+            if (bcls) {
+                bg2 = wubu_breath_detect(pcm16, n16, f0_raw ? f0_raw : nsff0, n_f0_2,
+                                         bcls, breath_gain, &bst);
+                /* Map classes to generator gains:
+                 *   BREATH    -> 1.0 × scale (boost noise, render inhale)
+                 *   CONSONANT -> 0.25          (leave legacy noise)
+                 *   VOICED    -> 0.25          (leave legacy noise)
+                 *   SILENCE   -> 0.0           (kill phantom breath) */
+                for (int j = 0; j < bg2; j++) {
+                    if (bcls[j] == WUBU_BREATH_BREATH) breath_gain[j] = 1.0f * breath_gain_scale;
+                    else if (bcls[j] == WUBU_BREATH_SILENCE) breath_gain[j] = 0.0f;
+                    else breath_gain[j] = 0.25f;
+                }
+                free(bcls);
+            }
+            n_breath = bg2;
+            if (bg2 > 0) {
+                printf("[5b3] breath: %d events (%.1f%% frames), %.2f s\n",
+                       bst.n_events, 100.0 * bst.breath_frac,
+                       (double)(clock() - t0) / CLOCKS_PER_SEC);
+            }
+        }
+    }
+
     /* 5c. harmony detection — dual fundamental (polyphonic) pitch.
      * Runs on the 16k PCM with the f0 contour as the continuity anchor.
      * Produces per-frame harmony_f0[] (Hz, 0 = monophonic) + gain[] used
@@ -872,6 +935,7 @@ int main(int argc, char **argv) {
         ctx.f0_coarse = f0_coarse; ctx.nsff0 = nsff0; ctx.n_f0 = n_f0_2;
         ctx.harmony_f0 = harmony_f0; ctx.harmony_gain = harmony_gain; ctx.n_harmony = n_harmony;
         ctx.uv_mask = uv_mask; ctx.n_uv = n_uv;
+        ctx.breath_gain = breath_gain; ctx.n_breath = n_breath;
         ctx.hb = &hb; ctx.rvc_ver = rvc_ver; ctx.content_dim = content_dim;
         ctx.model = rvc->model; ctx.speaker_id = speaker_id;
         ctx.noise_scale = noise_scale; ctx.use_snake = use_snake;
@@ -986,7 +1050,7 @@ int main(int argc, char **argv) {
     n_out = wubu_rvc_synthesize_real(rvc->model, cmaj, n_frames, content_dim,
                                      f0_coarse, nsff0, speaker_id, noise_scale,
                                      out_audio, max_audio, use_snake,
-                                     harmony_f0, harmony_gain, uv_mask);
+                                     harmony_f0, harmony_gain, uv_mask, breath_gain);
     synth_s = (double)(clock() - t0) / CLOCKS_PER_SEC;
     if (n_out <= 0) die("synth failed");
 
@@ -1008,7 +1072,7 @@ int main(int argc, char **argv) {
         n_out = wubu_rvc_synthesize_real(rvc->model, cmaj, n_frames, content_dim,
                                          f0_coarse, nsff0, speaker_id, noise_scale,
                                          out_audio, max_audio, use_snake,
-                                         harmony_f0, harmony_gain, uv_mask);
+                                         harmony_f0, harmony_gain, uv_mask, breath_gain);
         synth_s = (double)(clock() - t0) / CLOCKS_PER_SEC;
         if (n_out <= 0) die("synth failed (LeakyReLU fallback)");
     }
@@ -1119,7 +1183,8 @@ int main(int argc, char **argv) {
            (double)n_out / sr_out);
 
     free(pcm16); free(f0_coarse); free(nsff0); free(out_audio);
-    free(harmony_f0); free(harmony_gain); free(uv_mask);
+    free(harmony_f0); free(harmony_gain); free(uv_mask); free(breath_gain);
+    free(f0_raw);
     free(audio);
     wubu_hubert_free(&hb);
     wubu_rvc_destroy(rvc);

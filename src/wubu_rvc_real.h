@@ -77,13 +77,17 @@ int wubu_rvc_synthesize_real_cuda(WuBuRVCModel *model,
                                   int use_snake);
 
 /* Vulkan generator variant (wubu_vk.c): flow on CPU, GeneratorNSF via
- * Vulkan compute shaders (cross-vendor — NVIDIA/AMD/Intel). */
+ * Vulkan compute shaders (cross-vendor — NVIDIA/AMD/Intel). Quality arrays
+ * mirror wubu_rvc_synthesize_real: harmony_f0/harmony_gain, uv_mask,
+ * breath_gain (all NULLable). */
 int wubu_rvc_synthesize_real_vk(WuBuRVCModel *model,
                                 const float *content, int n_frames, int content_dim,
                                 const int *f0_coarse, const float *nsff0,
                                 int sid, float randn_scale,
                                 float *out_audio, int max_samples,
-                                int use_snake);
+                                int use_snake,
+                                const float *harmony_f0, const float *harmony_gain,
+                                const float *uv_mask, const float *breath_gain);
 
 /* CUDA GeneratorNSF (defined in wubu_rvc_cuda.cu). */
 int wubu_generator_nsf_cuda(WuBuRVCModel *model,

@@ -51,12 +51,17 @@ int wubu_vk_convt1d(WuBuVk *vk,
 
 /* Full GeneratorNSF on Vulkan — mirrors wubu_generator_nsf_cuda (flow stays
  * on the CPU; conv_pre, cond, sine, upsample blocks + noise convs + MRF,
- * conv_post run on the GPU). Returns the sample count or -1. */
+ * conv_post run on the GPU). Returns the sample count or -1.
+ * The trailing quality arrays mirror wubu_generator_nsf: harmony_f0 /
+ * harmony_gain (dual-fundamental sine injection), uv_mask (confidence-graded
+ * voicing 0..1), breath_gain (breath-existence gate). NULL = legacy. */
 int wubu_vk_generator_nsf(WuBuVk *vk, WuBuRVCModel *model,
                           const float *z, int nF, int inter_channels,
                           const float *nsff0, const float *g,
                           float *out_audio, int max_samples,
-                          int inject_noise, int use_snake);
+                          int inject_noise, int use_snake,
+                          const float *harmony_f0, const float *harmony_gain,
+                          const float *uv_mask, const float *breath_gain);
 
 /* ── training backward ops (synchronous, host buffers) ──
  * conv1d_bwd: din[ic,src] += g*w, dw[oc,ic,tap] += x*g, db[oc] += g.

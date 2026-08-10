@@ -41,15 +41,20 @@ int main(int argc, char **argv) {
     for (int i = 0; i < n_stems; i++) {
         char tmp[1024];
         snprintf(tmp, sizeof(tmp), "%s", argv[i + 3]);
-        char *colon = strchr(tmp, ':');
-        if (!colon) die("stem must be path:gain:pan");
-        *colon = 0;
-        char *gstr = colon + 1;
-        char *pstr = strchr(gstr, ':');
-        if (pstr) *pstr = 0;
-        gains[i] = (float)atof(gstr);
-        pans[i] = pstr ? (float)atof(pstr + 1) : 0.0f;
-        stems[i] = wubu_audio_read_stereo(tmp);
+        /* Windows drive letters: parse path:gain:pan from the RIGHT.
+         * Find last colon -> pan, previous colon -> gain, rest = path. */
+        char *p_pan = strrchr(tmp, ':');
+        if (!p_pan) die("stem must be path:gain:pan");
+        *p_pan = 0;
+        float pan = (float)atof(p_pan + 1);
+        char *p_gain = strrchr(tmp, ':');
+        if (!p_gain) die("stem must be path:gain:pan");
+        *p_gain = 0;
+        float gain = (float)atof(p_gain + 1);
+        char *path = tmp;
+        gains[i] = gain;
+        pans[i] = pan;
+        stems[i] = wubu_audio_read_stereo(path);
         if (!stems[i]) die("cannot read stem");
         if (stems[i]->sr != sr) {
             /* resample interleaved stereo to the bus rate */

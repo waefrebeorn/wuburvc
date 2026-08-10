@@ -2074,7 +2074,10 @@ int wubu_rvc_synthesize_real_vk(WuBuRVCModel *model,
                                 const int *f0_coarse, const float *nsff0,
                                 int sid, float randn_scale,
                                 float *out_audio, int max_samples,
-                                int use_snake) {
+                                int use_snake,
+                                const float *harmony_f0, const float *harmony_gain,
+                                const float *uv_mask, const float *breath_gain) {
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "[vk-trace] wubu_rvc_synthesize_real_vk ENTER n_frames=%d\n", n_frames);
     if (!model || !content || !out_audio || n_frames < 1) return -1;
     const RVCTensor *emb_g = T(model, "emb_g.weight");
     if (!emb_g) return -1;
@@ -2130,7 +2133,9 @@ int wubu_rvc_synthesize_real_vk(WuBuRVCModel *model,
     if (g_vk)
         n_out = wubu_vk_generator_nsf(g_vk, model, z, n_frames, inter, nsff0, g,
                                       out_audio, max_samples,
-                                      randn_scale > 0.0f, use_snake);
+                                      randn_scale > 0.0f, use_snake,
+                                      harmony_f0, harmony_gain,
+                                      uv_mask, breath_gain);
     pthread_mutex_unlock(&g_vk_mu);
     free(m); free(logs); free(x_mask); free(z_p); free(z);
     return n_out;

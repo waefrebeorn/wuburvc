@@ -17,7 +17,33 @@
 #include <string.h>
 #include <math.h>
 #include <stdio.h>
+#include <time.h>
 #include <omp.h>
+
+/* Thread-local xorshift32 PRNG for the sine-excitation noise — mirrors
+ * wubu_rvc_real.c exactly (same seed recipe, same Irwin-Hall Gaussian), so
+ * the VK sine dither matches the CPU path's stochastic behavior. */
+static _Thread_local uint32_t wubu_vk_rng_state = 0;
+
+static inline uint32_t wubu_vk_rng_next(void) {
+    uint32_t x = wubu_vk_rng_state;
+    if (x == 0) {
+        unsigned long t = (unsigned long)time(NULL) ^
+                          ((unsigned long)(uintptr_t)&wubu_vk_rng_state ^ 0x9E3779B9u);
+        x = (uint32_t)(t ^ (t >> 16));
+        if (x == 0) x = 0x12345678u;
+        wubu_vk_rng_state = x;
+    }
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    wubu_vk_rng_state = x;
+    return x;
+}
+
+static inline float wubu_vk_rand_uniform(float lo, float hi) {
+    return lo + (hi - lo) * ((float)(wubu_vk_rng_next() >> 8) / 16777216.0f);
+}
 
 #include "wubu_vk_conv_spv.h"
 #include "wubu_vk_convt_spv.h"
@@ -287,10 +313,15 @@ static int wslot(WuBuVk *vk, const char *name, const void *data, size_t sz) {
     for (int i = 0; i < vk->wn; i++) {
         if (strcmp(vk->wcache[i].name, name) == 0) return vk->wcache[i].slot;
     }
-    /* find a free slot >= 12 (0-8 per-call activations, 9/10 scratch, 11 cond,
-     * 199 = reserved GPU zero buffer — never hand it to a weight tensor!) */
+    /* find a free slot >= 16. Slots 0-15 are the generator's per-call
+     * working set (0 z, 1 x, 2 sine, 3 cur, 4/5 stage, 6 acc, 7 stage-
+     * preserve, 8 out, 10/11 scratch, 14 noise-out, etc.) and MUST never be
+     * handed to a weight tensor — wslot only tracks its own wcache, so
+     * starting at 12 (old bug) let a weight land on slot 14 and clobber the
+     * stage buffer / hit the DEVICE_LOCAL upload MAPFAIL. 199 = reserved
+     * (the old GPU zero buffer) — never hand it out either. */
     int slot = -1;
-    for (int s = 12; s < WUBU_VK_ZERO_SLOT; s++) {
+    for (int s = 16; s < WUBU_VK_ZERO_SLOT; s++) {
         int used = 0;
         for (int i = 0; i < vk->wn; i++) if (vk->wcache[i].slot == s) { used = 1; break; }
         if (!used) { slot = s; break; }
@@ -546,9 +577,13 @@ static void rec_elt(WuBuVk *vk, int a_s, size_t a_off, int b_s, size_t b_off,
     rec_sync(vk);
     VkDescriptorSet ds = dspool_get(vk, vk->dsl_elt);
     if (ds == VK_NULL_HANDLE) return;
+    /* mode 2 (a=0) has no B operand — bind A twice so the shader's b binding
+     * is valid but never read. */
+    int b_use = (b_s < 0) ? a_s : b_s;
+    size_t b_use_off = (b_s < 0) ? a_off : b_off;
     VkDescriptorBufferInfo dbi[2] = {
         {vk->buffers[a_s], a_off * 4, n * 4},
-        {vk->buffers[b_s], b_off * 4, n * 4},
+        {vk->buffers[b_use], b_use_off * 4, n * 4},
     };
     VkWriteDescriptorSet wds[2] = {0};
     for (int i = 0; i < 2; i++) {
@@ -613,6 +648,7 @@ static VkDescriptorSet alloc_ds(WuBuVk *vk, int slot, VkDescriptorSetLayout dsl)
 }
 
 WuBuVk *wubu_vk_create(void) {
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "[vk-trace] wubu_vk_create ENTER\n");
     WuBuVk *vk = (WuBuVk *)calloc(1, sizeof(WuBuVk));
     if (!vk) return NULL;
     VkApplicationInfo ai = { .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
@@ -1241,7 +1277,10 @@ int wubu_vk_generator_nsf(WuBuVk *vk, WuBuRVCModel *model,
                           const float *z, int nF, int inter_channels,
                           const float *nsff0, const float *g,
                           float *out_audio, int max_samples,
-                          int inject_noise, int use_snake) {
+                          int inject_noise, int use_snake,
+                          const float *harmony_f0, const float *harmony_gain,
+                          const float *uv_mask, const float *breath_gain) {
+    if (getenv("WUBU_VK_DBG")) fprintf(stderr, "[vk-trace] wubu_vk_generator_nsf ENTER nF=%d vk=%p\n", nF, (void*)vk);
     (void)g;
     double tg0 = omp_get_wtime();   /* total generator wall (incl. record) */
     if (!vk || !model || !z || !out_audio) return -1;
@@ -1255,9 +1294,13 @@ int wubu_vk_generator_nsf(WuBuVk *vk, WuBuRVCModel *model,
      * call. Drain the queue BEFORE the first host upload. */
     if (vk->pipe_submit) vkQueueWaitIdle(vk->q);
     if (getenv("WUBU_VK_DUMP"))
-        fprintf(stderr, "[vkg] generator_nsf entered nF=%d inter=%d ups_total=%d\n",
+        fprintf(stderr, "[vkg] generator_nsf entered nF=%d inter=%d (n_ups=%d rates=%d,%d,%d,%d,%d,%d,%d,%d)\n",
                 nF, inter_channels,
-                model->n_upsample_layers > 0 ? model->n_upsample_layers : 4);
+                model->n_upsample_layers,
+                model->upsample_rates[0], model->upsample_rates[1],
+                model->upsample_rates[2], model->upsample_rates[3],
+                model->upsample_rates[4], model->upsample_rates[5],
+                model->upsample_rates[6], model->upsample_rates[7]);
 
     int n_ups = model->n_upsample_layers > 0 ? model->n_upsample_layers : 4;
     const RVCTensor *pre_w0 = wubu_rvc_find_tensor(model, "dec.conv_pre.weight");
@@ -1280,14 +1323,24 @@ int wubu_vk_generator_nsf(WuBuVk *vk, WuBuRVCModel *model,
 
     const RVCTensor *pre_w = wubu_rvc_find_tensor(model, "dec.conv_pre.weight");
     const RVCTensor *pre_b = wubu_rvc_find_tensor(model, "dec.conv_pre.bias");
-    if (!pre_w || !pre_w->data) return -1;
+    if (!pre_w || !pre_w->data) { if (getenv("WUBU_VK_DUMP")) fprintf(stderr, "[vkg] FAIL pre_w\n"); return -1; }
     int cur_ch = ups_in[0], cur_n = nF;
 
     /* host scratch */
     float *sine = (float *)malloc((size_t)(nF * ups_total + 8) * sizeof(float));
     float *rad = (float *)malloc((size_t)nF * sizeof(float));
     float *rad_acc = (float *)malloc((size_t)nF * sizeof(float));
-    if (!sine || !rad || !rad_acc) { free(sine); free(rad); free(rad_acc); return -1; }
+    float *carry = (float *)malloc((size_t)nF * sizeof(float));
+    float *shim_arr = (float *)malloc((size_t)nF * sizeof(float));
+    float *hrad = harmony_f0 ? (float *)malloc((size_t)nF * sizeof(float)) : NULL;
+    float *hcarry = hrad ? (float *)malloc((size_t)nF * sizeof(float)) : NULL;
+    float *hrad_acc = hrad ? (float *)malloc((size_t)nF * sizeof(float)) : NULL;
+    if (!sine || !rad || !rad_acc || !carry || !shim_arr ||
+        (harmony_f0 && (!hrad || !hcarry || !hrad_acc))) {
+        if (getenv("WUBU_VK_DUMP")) fprintf(stderr, "[vkg] FAIL sine alloc\n");
+        free(sine); free(rad); free(rad_acc); free(carry); free(shim_arr);
+        free(hrad); free(hcarry); free(hrad_acc); return -1;
+    }
 
     /* pool slots: 0 z, 1 x, 2 sine, 3 cur, 4 tmp(stage), 5 tmp2, 6 acc, 7 stage-preserve,
      * 8 out, 9..13 weight/bias scratch (per-op uploads), 14 nc (noise out) */
@@ -1305,26 +1358,29 @@ int wubu_vk_generator_nsf(WuBuVk *vk, WuBuRVCModel *model,
         for (int L = 0; L < n_ups; L++) {
             int och = init_ch / (1 << (L + 1));
             int on = (in_n - 1) * ups_rate[L] - 2 * ups_pad[L] + ups_k[L];
-            if (on <= 0) return -1;
+            if (on <= 0) { if (getenv("WUBU_VK_DUMP")) fprintf(stderr, "[vkg] FAIL on<=0 L=%d\n", L); return -1; }
             size_t st = (size_t)och * on * 4;
             if (st > max_stage) max_stage = st;
             if (st * 3 > max_acc) max_acc = st * 3;
             ich = och; in_n = on;
         }
-        if (max_stage == 0) return -1;
-        if (pool_slot(vk, 3, max_stage) || pool_slot(vk, 4, max_stage) ||
-            pool_slot(vk, 5, max_stage) || pool_slot(vk, 7, max_stage) ||
-            pool_slot(vk, 14, max_stage) || pool_slot(vk, 6, max_acc)) return -1;
+        if (max_stage == 0) { if (getenv("WUBU_VK_DUMP")) fprintf(stderr, "[vkg] FAIL max_stage 0\n"); return -1; }
+        /* STAGE/ACC BUFFERS ARE GPU-ONLY → DEVICE_LOCAL (pool_slot_dev).
+         * Allocating them host-visible (pool_slot) put ~390MB into the
+         * ~256MB PCIe BAR on the 2080 SUPER — vkAllocateMemory failed, the
+         * generator returned -1, and the CLI silently wrote zeros (the
+         * "VK works but outputs silence" bug). Training already used
+         * pool_slot_dev; the generator now matches. */
+        if (pool_slot_dev(vk, 3, max_stage) || pool_slot_dev(vk, 4, max_stage) ||
+            pool_slot_dev(vk, 5, max_stage) || pool_slot_dev(vk, 7, max_stage) ||
+            pool_slot_dev(vk, 14, max_stage) || pool_slot_dev(vk, 6, max_acc)) { if (getenv("WUBU_VK_DUMP")) fprintf(stderr, "[vkg] FAIL pool 3-6\n"); return -1; }
     }
     if (pool_slot(vk, 0, z_sz) || pool_slot(vk, 1, x_sz) || pool_slot(vk, 2, sine_sz) ||
-        pool_slot(vk, 8, out_sz)) return -1;
-    /* persistent zero buffer (slot 199) for GPU-side acc zeroing — written ONCE
-     * per generator call BEFORE any dispatch, so no host/GPU race. Slot is
-     * RESERVED: wslot() stops at WUBU_VK_ZERO_SLOT so no weight tensor can
-     * ever overwrite it (that clobbering was a real bug — weights landed on
-     * slot 19, corrupted the acc-zero copy, and silently broke the MRF). */
-    if (pool_slot(vk, WUBU_VK_ZERO_SLOT, max_acc)) return -1;
-    upload(vk, WUBU_VK_ZERO_SLOT, NULL, max_acc);
+        pool_slot(vk, 8, out_sz)) { if (getenv("WUBU_VK_DUMP")) fprintf(stderr, "[vkg] FAIL pool 0-8\n"); return -1; }
+    /* NO host-visible zero buffer: the MRF acc-zero uses elt mode 2 (a=0)
+     * on the GPU — a 146MB host zero-upload per generator call was both a
+     * BAR hog (see above) and a per-chunk PCIe cost. slot 199 stays reserved
+     * so wslot() never uses it. */
     upload(vk, 0, z, z_sz);
 
     /* fresh descriptor sets per generator call. The waitIdle at the top of
@@ -1338,15 +1394,17 @@ int wubu_vk_generator_nsf(WuBuVk *vk, WuBuRVCModel *model,
      * left no_flush set and the command buffer open. Reset both so this
      * call records cleanly. */
     vk->no_flush = 0;
-    /* In pipelined mode the ring MUST restart at slot 0 — vk->cb may point at
-     * an arbitrary ring slot left by the previous call, and cb_ring_n resets
-     * to 0 below. Mismatch = fence guards the wrong buffer = corruption.
-     * The top waitIdle already drained the previous call, so every ring
-     * fence is signaled; reset slot 0 so the first submit arms it cleanly. */
+    /* Pipelined mode: CONTINUE the ring cycle from where the previous call
+     * left off — do NOT reset cb_ring_n and do NOT reset any fence. The
+     * previous call's last rec_flush waited+reset the current slot's fence
+     * (so it is UNSIGNALED and ready to arm with our first submit) and every
+     * other slot's fence is SIGNALED (the top waitIdle drained the previous
+     * call). Resetting cb_ring_n=0 (old bug) breaks this: a call that ended
+     * on slot 5 leaves fence[6] reset-but-never-armed, so the next call's
+     * 6th dispatch waits fence[6] forever — the chunk-3 deadlock. This is
+     * the same cycle-continuation rule train_begin already uses. */
     if (vk->pipe_submit) {
-        vk->cb = vk->cb_ring[0];
-        if (vk->cb_fence[0] != VK_NULL_HANDLE)
-            vkResetFences(vk->dev, 1, &vk->cb_fence[0]);
+        vk->cb = vk->cb_ring[vk->cb_ring_n % 8];
     }
     if (getenv("WUBU_VK_SUBMIT_PER_OP") == NULL)
         vkResetCommandBuffer(vk->cb, 0);
@@ -1362,14 +1420,16 @@ int wubu_vk_generator_nsf(WuBuVk *vk, WuBuRVCModel *model,
      * them. One vkQueueWaitIdle at the end. The old per-op (wait per
      * dispatch) is the fallback; WUBU_VK_SINGLE_BUFFER opts into the broken
      * barrier experiment. */
-    vk->cb_ring_n = 0;
 
     /* conv_pre — weights CACHED (uploaded once, resident across chunks) */
+    if (getenv("WUBU_VK_DUMP"))
+        fprintf(stderr, "[vkg] A: pre_w=%p cur_ch=%d cur_n=%d nF=%d ups_total=%d\n",
+                (void*)pre_w, cur_ch, cur_n, nF, ups_total);
     size_t pre_w_sz = (size_t)pre_w->dims[0] * pre_w->dims[1] * pre_w->dims[2] * 4;
     size_t pre_b_sz = (size_t)pre_w->dims[0] * 4;
     int pre_w_s = wslot(vk, "dec.conv_pre.weight", pre_w->data, pre_w_sz);
     int pre_b_s = wslot(vk, "dec.conv_pre.bias", pre_b && pre_b->data ? pre_b->data : NULL, pre_b_sz);
-    if (pre_w_s < 0 || pre_b_s < 0) return -1;
+    if (pre_w_s < 0 || pre_b_s < 0) { if (getenv("WUBU_VK_DUMP")) fprintf(stderr, "[vkg] A2: wslot FAIL\n"); return -1; }
     int pk = pre_w->dims[2];
     rec_conv1d(vk, 0, pre_w_s, pre_b_s, 1, inter_channels, nF, cur_ch, pk, 1, pk / 2, 1, cur_n, 0, 0);
     /* cond(g): per-channel offset = cond_b[oc] + sum_ic g[ic]*cond_w[oc,ic] */
@@ -1400,7 +1460,10 @@ int wubu_vk_generator_nsf(WuBuVk *vk, WuBuRVCModel *model,
         free(tmp);
     }
 
-    /* sine excitation (host, exact CPU formula) */
+    /* sine excitation (host, exact CPU formula — mirrors wubu_generator_nsf
+     * in wubu_rvc_real.c including jitter/shimmer, harmony second sine,
+     * confidence-graded uv_mask, breath gate, and Irwin-Hall Gaussian
+     * noise. Keep in sync with the CPU path. */
     {
         float sr = model->sample_rate > 0 ? (float)model->sample_rate : 40000.0f;
         /* CRITICAL: the real tensor is dec.m_source.l_linear.* — the old
@@ -1412,35 +1475,97 @@ int wubu_vk_generator_nsf(WuBuVk *vk, WuBuRVCModel *model,
         const RVCTensor *linb = wubu_rvc_find_tensor(model, "dec.m_source.l_linear.bias");
         float linw_v = (linw && linw->data) ? linw->data[0] : 1.0f;
         float linb_v = (linb && linb->data) ? linb->data[0] : 0.0f;
-        float accum = 0.0f;
-        for (int t = 0; t < nF; t++) {
-            float f0 = nsff0[t] > 0 ? nsff0[t] : 0.0f;
-            rad[t] = f0 / sr;
-            float c = rad[t] * (float)ups_total;
-            float r2 = fmodf(c + 0.5f, 1.0f) - 0.5f;
-            accum += r2;
-            rad_acc[t] = fmodf(accum, 1.0f);
+        /* Step 1: rad = f0/sr per frame */
+        for (int j = 0; j < nF; j++) {
+            float f0 = nsff0[j];
+            rad[j] = (f0 > 0 ? f0 : 0.0f) / (float)sr;
+            if (hrad) {
+                float hf = (harmony_f0[j] > 0.0f) ? harmony_f0[j] : 0.0f;
+                hrad[j] = hf / (float)sr;
+            }
         }
+        /* Step 2: carry / rad_acc (with jitter+shimmer, gated by inject_noise) */
+        float jit_amp = (inject_noise) ? 0.005f : 0.0f;   /* ±0.5% period */
+        float shim_amp = (inject_noise) ? 0.03f : 0.0f;   /* ±3% amplitude */
+        float accum = 0.0f, haccum = 0.0f;
+        for (int t = 0; t < nF; t++) {
+            float jit = 0.0f, shim = 1.0f;
+            if (jit_amp > 0.0f && nsff0[t] > 40.0f) {
+                jit = wubu_vk_rand_uniform(-jit_amp, jit_amp);
+                shim = 1.0f + wubu_vk_rand_uniform(-shim_amp, shim_amp);
+            }
+            carry[t] = rad[t] * (float)ups_total * (1.0f + jit);
+            float rad2 = fmodf(carry[t] + 0.5f, 1.0f) - 0.5f;
+            accum += rad2;
+            rad_acc[t] = fmodf(accum, 1.0f);
+            shim_arr[t] = shim;
+            if (hrad) {
+                hcarry[t] = hrad[t] * (float)ups_total;
+                float hrad2 = fmodf(hcarry[t] + 0.5f, 1.0f) - 0.5f;
+                haccum += hrad2;
+                hrad_acc[t] = fmodf(haccum, 1.0f);
+            }
+        }
+        /* Step 3: sine[j] = sin(2π·(rad[frame]·(u+1) + carry_prev)) · 0.1 · uv */
         for (int j = 0; j < nF * ups_total; j++) {
             int fi = j / ups_total;
             if (fi >= nF) fi = nF - 1;
             int u = j % ups_total;
             float phase = rad[fi] * (float)(u + 1);
             if (fi > 0) phase += rad_acc[fi - 1];
+            /* Harmony: second sine at the harmony fundamental, blended by
+             * harmony_gain (same as CPU path). */
+            float harm_phase = 0.0f;
+            float hg = 0.0f;
+            if (hrad && harmony_f0 && harmony_gain && harmony_f0[fi] > 0.0f) {
+                harm_phase = hrad[fi] * (float)(u + 1);
+                if (fi > 0) harm_phase += hrad_acc[fi - 1];
+                hg = harmony_gain[fi];
+                if (hg < 0.0f) hg = 0.0f;
+                if (hg > 1.0f) hg = 1.0f;
+            }
             float s = sinf(2.0f * (float)M_PI * phase) * 0.1f;
-            float uv = (nsff0[fi] > 0) ? 1.0f : 0.0f;
-            float noise_amp = inject_noise ? (1.0f - uv) * 0.1f / 3.0f : 0.0f;
-            float noise = noise_amp * (2.0f * ((float)rand() / RAND_MAX) - 1.0f);
-            sine[j] = tanhf(linw_v * (s * uv + noise) + linb_v);
+            if (shim_arr && shim_arr[fi] != 1.0f) s *= shim_arr[fi];
+            if (hg > 0.0f) {
+                float hs = sinf(2.0f * (float)M_PI * harm_phase) * 0.1f;
+                s += hs * hg;
+            }
+            float sv = (nsff0[fi] > 0) ? 1.0f : 0.0f;
+            /* Confidence-graded voicing mask (0..1) replaces the hard uv */
+            if (uv_mask) {
+                float uvj = uv_mask[fi];
+                sv = (uvj > 0.02f) ? uvj : 0.0f;
+            }
+            /* RVC-exact noise: uv·0.003 + (1-uv)·0.1/3, Gaussian via
+             * Irwin-Hall sum of 12 U(-1,1) — same as CPU path. */
+            float noise_amp = inject_noise ? (sv * 0.003f + (1.0f - sv) * 0.1f / 3.0f) : 0.0f;
+            if (breath_gain) {
+                float bg = breath_gain[fi];
+                if (bg > 0.5f) {
+                    noise_amp = (sv * 0.003f + (1.0f - sv) * 0.1f / 3.0f)
+                                * (1.0f + bg * 2.0f);
+                } else if (bg <= 0.05f) {
+                    noise_amp = 0.0f;   /* silence: no phantom breath */
+                }
+            }
+            float g = 0.0f;
+            if (noise_amp > 0.0f) {
+                for (int _u = 0; _u < 12; _u++)
+                    g += wubu_vk_rand_uniform(-1.0f, 1.0f);
+                g *= noise_amp;
+            }
+            float sw = s * sv + g;
+            sine[j] = tanhf(linw_v * sw + linb_v);
         }
         if (getenv("WUBU_VK_DUMP")) {
-            fprintf(stderr, "[vkg] about to write vk_sine.npy (%d samples)\\n", nF * ups_total);
+            fprintf(stderr, "[vkg] about to write vk_sine.npy (%d samples)\n", nF * ups_total);
             FILE *df = fopen("outputs/rvc_ref/vk_sine.npy", "wb");
             if (df) { fwrite(sine, sizeof(float), (size_t)nF * ups_total, df); fclose(df); }
         }
         upload(vk, 2, sine, sine_sz);
     }
-    free(sine); free(rad); free(rad_acc);
+    free(sine); free(rad); free(rad_acc); free(carry); free(shim_arr);
+    free(hrad); free(hcarry); free(hrad_acc);
 
     /* d_cur = d_x */
     rec_elt(vk, 3, 0, 1, 0, 1, (size_t)cur_ch * cur_n);
@@ -1455,11 +1580,11 @@ int wubu_vk_generator_nsf(WuBuVk *vk, WuBuRVCModel *model,
         /* allocate ALL the layer's buffers BEFORE recording any dispatch that
          * uses them — the pool realloc must never free a buffer an already
          * recorded dispatch still references. */
-        if (pool_slot(vk, 4, stage_sz) || pool_slot(vk, 5, stage_sz) ||
-            pool_slot(vk, 6, (size_t)3 * out_ch * out_n * 4) ||
-            pool_slot(vk, 7, stage_sz) ||
-            pool_slot(vk, 3, (size_t)out_ch * out_n * 4) ||
-            pool_slot(vk, 14, stage_sz)) return -1;
+        if (pool_slot_dev(vk, 4, stage_sz) || pool_slot_dev(vk, 5, stage_sz) ||
+            pool_slot_dev(vk, 6, (size_t)3 * out_ch * out_n * 4) ||
+            pool_slot_dev(vk, 7, stage_sz) ||
+            pool_slot_dev(vk, 3, (size_t)out_ch * out_n * 4) ||
+            pool_slot_dev(vk, 14, stage_sz)) return -1;
 
         rec_act(vk, 3, -1, use_snake ? 1 : 0, in_ch, in_n, 0.0f);
 
@@ -1511,7 +1636,7 @@ int wubu_vk_generator_nsf(WuBuVk *vk, WuBuRVCModel *model,
                 int nw_s = wslot(vk, nk1, ncw->data, ncw_sz);
                 int nb_s = wslot(vk, nk2, ncb && ncb->data ? ncb->data : NULL, ncb_sz);
                 if (nw_s < 0 || nb_s < 0) return -1;
-                if (pool_slot(vk, 14, stage_sz)) return -1;
+                if (pool_slot_dev(vk, 14, stage_sz)) return -1;
                 rec_conv1d(vk, 2, nw_s, nb_s, 14, 1, nF * ups_total, out_ch, kk, stride,
                            pad, 1, out_n, 0, 0);
                 rec_elt(vk, 4, 0, 14, 0, 0, (size_t)out_ch * out_n);
@@ -1530,15 +1655,13 @@ int wubu_vk_generator_nsf(WuBuVk *vk, WuBuRVCModel *model,
             size_t n2 = (size_t)ch * out_n;
             /* preserve the stage in slot 7 (the carry copies overwrite slot 4) */
             rec_elt(vk, 7, 0, 4, 0, 1, n2);
-            /* zero the acc — host memset is safe in wait mode (each dispatch
-             * is waited, so the previous layer's rec_elt(vk,6,...) has
-             * finished). In pipelined mode the host write would race the GPU,
-             * so use the GPU-side zero buffer (slot 19) there. */
-            if (pool_slot(vk, 6, (size_t)n_stacks * ch * out_n * 4)) return -1;
-            if (vk->pipe_submit)
-                rec_elt(vk, 6, 0, WUBU_VK_ZERO_SLOT, 0, 1, (size_t)n_stacks * ch * out_n);
-            else
-                upload(vk, 6, NULL, (size_t)n_stacks * ch * out_n * 4);
+            /* zero the acc on the GPU (elt mode 2, a=0) — DEVICE_LOCAL slot 6
+             * can't be host-memset anyway, and the mode-2 dispatch is safe in
+             * pipelined mode (the submit boundary orders it after the previous
+             * layer's writes). The old path copied from a host-visible 146MB
+             * zero buffer (slot 199) that exhausted the PCIe BAR. */
+            if (pool_slot_dev(vk, 6, (size_t)n_stacks * ch * out_n * 4)) return -1;
+            rec_elt(vk, 6, 0, -1, 0, 2, (size_t)n_stacks * ch * out_n);
             /* weight slots are CACHED per tensor (wslot) — no shared realloc,
              * no freed-memory bug, no re-upload per chunk */
             for (int s = 0; s < n_stacks; s++) {

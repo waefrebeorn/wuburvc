@@ -39,7 +39,9 @@ RVC_SRCS="src/wubu_rvc.c src/wubu_rvc_parity.c src/wubu_rvc_weights.c \
           src/wubu_rvc_kernels_exact.c src/wubu_rvc_real.c src/wubu_rvc_hubert.c \
           src/wubu_rvc_f0.c src/wubu_postproc.c src/wubu_rmvpe.c \
           src/wubu_stft.c src/wubu_gru.c src/wubu_audioio.c \
-          src/wubu_pitch.c src/wubu_autokey.c src/wubu_fft.c src/wubu_math.c src/wubu_vk.c"
+          src/wubu_pitch.c src/wubu_autokey.c src/wubu_fft.c src/wubu_math.c src/wubu_vk.c \
+          src/wubu_harmony.c src/wubu_consonant.c src/wubu_breath.c \
+          src/wubu_train.c src/wubu_train_vk.c"
 
 log() { printf '\033[1;36m[build]\033[0m %s\n' "$*"; }
 
@@ -101,6 +103,21 @@ export TMP="$(pwd)/build/tmp" TEMP="$(pwd)/build/tmp" TMPDIR="$(pwd)/build/tmp"
     -lm "$CUDART" "$VULKAN_LNK" -o "build/${TARGET}.exe"
 log "linked: $(ls -la build/${TARGET}.exe | awk '{print $5}') bytes"
 # fail loudly if any referenced symbol is missing (gcc reports at link time)
+
+# ── 4b. REBUILD MIXMASTER (album pipeline dependency) ────────────────────────
+# Step 1's `rm -f build/*.exe` deletes wubu_mixmaster.exe, and the album
+# pipeline (tools/album_build.py / wubu_album_pipeline.py) hard-fails without
+# it — so a clean build MUST recreate it or the next album run breaks. The
+# Makefile.win recipe is the canonical build (C11, O2, no OpenMP needed).
+if [[ " $FLAGS " != *" --no-mixmaster "* ]]; then
+    log "step 4b: rebuilding wubu_mixmaster.exe (album mix dependency)"
+    "$GCC" -std=c11 -O2 -I src tools/wubu_mixmaster.c \
+        src/wubu_master.c src/wubu_audioio.c -lm \
+        -o build/wubu_mixmaster.exe
+    log "mixmaster linked: $(ls -la build/wubu_mixmaster.exe | awk '{print $5}') bytes"
+else
+    log "step 4b: SKIP mixmaster rebuild (--no-mixmaster)"
+fi
 
 # ── 5. INSTALL ───────────────────────────────────────────────────────────────
 if [[ " $FLAGS " != *" --no-copy "* ]]; then

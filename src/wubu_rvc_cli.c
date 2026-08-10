@@ -264,7 +264,17 @@ static void *chunk_worker(void *arg) {
                                                 ctx->f0_coarse + f0_start,
                                                 ctx->nsff0 + f0_start,
                                                 ctx->speaker_id, ctx->noise_scale,
-                                                aout, max_a, ctx->use_snake);
+                                                aout, max_a, ctx->use_snake,
+                                                (ctx->harmony_f0 && ctx->harmony_gain &&
+                                                 f0_start < ctx->n_harmony)
+                                                    ? ctx->harmony_f0 + f0_start : NULL,
+                                                (ctx->harmony_f0 && ctx->harmony_gain &&
+                                                 f0_start < ctx->n_harmony)
+                                                    ? ctx->harmony_gain + f0_start : NULL,
+                                                (ctx->uv_mask && f0_start < ctx->n_uv)
+                                                    ? ctx->uv_mask + f0_start : NULL,
+                                                (ctx->breath_gain && f0_start < ctx->n_breath)
+                                                    ? ctx->breath_gain + f0_start : NULL);
         else if (ctx->use_cuda)
             n_out = wubu_rvc_synthesize_real_cuda(ctx->model, cmaj, nf, ctx->content_dim,
                                                   ctx->f0_coarse + f0_start,

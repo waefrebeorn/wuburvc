@@ -61,6 +61,12 @@ void wubu_train_registry_zero_grads(WuBuTrainRegistry *reg);
 float wubu_mse_loss(const float *a, const float *b, int n);
 float wubu_mae_loss(const float *a, const float *b, int n);
 float wubu_stft_loss(const float *a, const float *b, int n, int sr);
+
+/* Multi-scale STFT spectral loss WITH gradient flow (Qwen3-TTS/HiFi-GAN
+ * recipe). Returns the spectral loss and fills grad_out[n] with dL/dx so
+ * the trainer can supervise the spectrum, not just raw waveform MSE. */
+float wubu_stft_loss_grad(const float *a, const float *b, int n, int sr,
+                          float *grad_out, int n_scales);
 float wubu_gan_g_loss(float d_real_out);
 float wubu_gan_d_loss(float d_real_out, float d_fake_out);
 

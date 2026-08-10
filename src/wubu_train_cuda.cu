@@ -813,13 +813,42 @@ int wubu_train_step_cuda(WuBuRVCModel *model, WuBuTrainRegistry *reg, WuBuAdamW 
     float mse = 0.0f;
     for (int i = 0; i < n; i++) { float e = audio[i] - wav[i]; mse += e * e; }
     mse /= (float)n;
-    if (loss_out) *loss_out = mse;
-    model->last_loss = mse;
+
+    /* Spectral supervision (Qwen3-TTS/HiFi-GAN recipe) — same as CPU/VK:
+     * multi-scale STFT linear+log magnitude loss with gradient flow.
+     * WUBU_SPECTRAL_WEIGHT tunes λ (default 1.0); 0 = pure MSE. */
+    float spectral_weight = 1.0f;
+    const char *sw = getenv("WUBU_SPECTRAL_WEIGHT");
+    if (sw) spectral_weight = (float)atof(sw);
+    float spec_loss = 0.0f;
+    float *d_spec = NULL;
+    if (spectral_weight > 0.0f && n > 128) {
+        d_spec = (float *)malloc((size_t)n_out * sizeof(float));
+        if (d_spec) {
+            spec_loss = wubu_stft_loss_grad(audio, wav, n, 40000, d_spec, 3);
+            float gnorm = 0.0f;
+            for (int i = 0; i < n; i++) gnorm += d_spec[i] * d_spec[i];
+            gnorm = sqrtf(gnorm / (float)n);
+            if (gnorm > 1e-9f && mse > 1e-12f) {
+                float scale = spectral_weight * 0.5f * (2.0f / (float)n) * sqrtf(mse) / gnorm;
+                for (int i = 0; i < n; i++) d_spec[i] *= scale;
+            } else {
+                for (int i = 0; i < n; i++) d_spec[i] = 0.0f;
+            }
+        }
+    }
+
+    float total_loss = mse + spec_loss;
+    if (loss_out) *loss_out = total_loss;
+    model->last_loss = total_loss;
     model->last_epoch = epoch;
 
     float *d_audio = (float *)malloc((size_t)n_out * sizeof(float));
-    if (!d_audio) { free(audio); wubu_train_cache_free_cuda(cache); return -1; }
-    for (int i = 0; i < n; i++) d_audio[i] = 2.0f * (audio[i] - wav[i]) / (float)n;
+    if (!d_audio) { free(d_spec); free(audio); wubu_train_cache_free_cuda(cache); return -1; }
+    for (int i = 0; i < n; i++) {
+        d_audio[i] = 2.0f * (audio[i] - wav[i]) / (float)n;
+        if (d_spec) d_audio[i] += d_spec[i];
+    }
     for (int i = n; i < n_out; i++) d_audio[i] = 0.0f;
 
     wubu_train_registry_zero_grads(reg);
@@ -831,8 +860,9 @@ int wubu_train_step_cuda(WuBuRVCModel *model, WuBuTrainRegistry *reg, WuBuAdamW 
     for (int i = 0; i < reg->count; i++)
         wubu_adamw_step(opt, i, reg->params[i].data, reg->params[i].grad);
 
+    free(d_spec);
     free(d_audio);
     free(audio);
     wubu_train_cache_free_cuda(cache);
-    return (mse < 0.1f) ? 1 : 0;
+    return (total_loss < 0.1f) ? 1 : 0;
 }

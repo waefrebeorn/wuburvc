@@ -32,6 +32,7 @@
 #include "wubu_rvc.h"
 #include "wubu_rvc_parity.h"
 #include "wubu_rvc_real.h"
+#include "wubu_fft.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -310,6 +311,136 @@ float wubu_stft_loss(const float *sig_a, const float *sig_b, int n, int sr) {
         log_loss /= (float)total_bins;
         total_loss += 0.5f * (lin_loss + log_loss);
         free(win); free(mag_a); free(mag_b);
+    }
+    return total_loss / (float)n_scales;
+}
+
+/* ── Multi-scale STFT spectral loss WITH gradient flow (Qwen3-TTS / HiFi-GAN
+ * training recipe) ──
+ *
+ * The old wubu_stft_loss is evaluation-only: it computes a scalar but its
+ * gradient never reaches the weights, so wubu_train_step trained on MSE of
+ * raw waveform samples alone. SOTA vocoders (HiFi-GAN, BigVGAN, Qwen3-TTS)
+ * supervise the SPECTRUM: MSE/L1 on the waveform PLUS linear+log magnitude
+ * loss at multiple STFT scales. The spectral term is what keeps harmonics
+ * and formants sharp — MSE alone washes them out.
+ *
+ * Gradient via the DIRECT DFT (no FFT-adjoint conventions to get wrong):
+ *   X[k] = Σ_m x[m]·(cos θ - j sin θ), θ = 2πkm/N
+ *   |X[k]|² = Re² + Im²
+ *   d|X[k]|/dx[n] = (1/|X[k]|)·[Re·cos θn - Im·sin θn]
+ * The per-bin weight dm = dL/d|X| (linear + log terms), and the gradient
+ * is summed over positive bins only (Hermitian pairs double it — the loss
+ * sums over k=1..N/2 which already counts each spectral line once).
+ *
+ * Returns the spectral loss (scalar), fills grad_out[n] with dL/dx.
+ */
+float wubu_stft_loss_grad(const float *sig_a, const float *sig_b, int n, int sr,
+                          float *grad_out, int n_scales) {
+    (void)sr;
+    if (!sig_a || !sig_b || !grad_out || n <= 0) return 0.0f;
+    if (n_scales <= 0) n_scales = 3;
+    int wins[] = {512, 256, 128};
+    float total_loss = 0.0f;
+
+    memset(grad_out, 0, (size_t)n * sizeof(float));
+
+    for (int si = 0; si < n_scales && si < 3; si++) {
+        int w = wins[si];
+        int hop = w / 4;
+        int n_frames = (n - w) / hop + 1;
+        if (n_frames < 1) n_frames = 1;
+
+        float *win = (float *)malloc((size_t)w * sizeof(float));
+        if (!win) continue;
+        for (int i = 0; i < w; i++)
+            win[i] = 0.5f - 0.5f * cosf(2.0f * (float)M_PI * (float)i / (float)(w - 1));
+
+        float *frame_a = (float *)calloc((size_t)w, sizeof(float));
+        float *frame_b = (float *)calloc((size_t)w, sizeof(float));
+        float *re_a = (float *)malloc((size_t)(w / 2 + 1) * sizeof(float));
+        float *im_a = (float *)malloc((size_t)(w / 2 + 1) * sizeof(float));
+        if (!frame_a || !frame_b || !re_a || !im_a) {
+            free(win); free(frame_a); free(frame_b); free(re_a); free(im_a); continue;
+        }
+        int nbins = w / 2 + 1;
+        double scale_loss = 0.0;
+
+        for (int f = 0; f < n_frames; f++) {
+            int start = f * hop;
+            for (int i = 0; i < w; i++) {
+                int idx = start + i;
+                float sa = (idx < n) ? sig_a[idx] : 0.0f;
+                float sb = (idx < n) ? sig_b[idx] : 0.0f;
+                frame_a[i] = sa * win[i];
+                frame_b[i] = sb * win[i];
+            }
+            /* direct DFT of both frames */
+            for (int b = 0; b < nbins; b++) {
+                float ra = 0, ia = 0, rb = 0, ib = 0;
+                for (int t = 0; t < w; t++) {
+                    float ph = -2.0f * (float)M_PI * (float)b * (float)t / (float)w;
+                    float ca = cosf(ph), sa = sinf(ph);
+                    ra += frame_a[t] * ca; ia += frame_a[t] * sa;
+                    rb += frame_b[t] * ca; ib += frame_b[t] * sa;
+                }
+                re_a[b] = ra; im_a[b] = ia;
+                (void)rb; (void)ib;
+            }
+            float dsum = 0.0f, dlog = 0.0f;
+            /* per-bin magnitude of the reference (b) — compute once */
+            float *mag_b = (float *)malloc((size_t)nbins * sizeof(float));
+            if (!mag_b) break;
+            for (int b = 0; b < nbins; b++) {
+                float rb = 0, ib = 0;
+                for (int t = 0; t < w; t++) {
+                    float ph = -2.0f * (float)M_PI * (float)b * (float)t / (float)w;
+                    rb += frame_b[t] * cosf(ph);
+                    ib += frame_b[t] * sinf(ph);
+                }
+                mag_b[b] = sqrtf(rb * rb + ib * ib);
+            }
+            for (int b = 1; b < nbins; b++) {   /* k=1..N/2 (skip DC) */
+                float ma = sqrtf(re_a[b] * re_a[b] + im_a[b] * im_a[b]);
+                float mb = mag_b[b];
+                float la = ma + 1e-10f, lb = mb + 1e-10f;
+                dsum += fabsf(ma - mb);
+                int linonly = getenv("WUBU_SPEC_LINONLY") != NULL;
+                if (!linonly) dlog += fabsf(logf(la) - logf(lb));
+                /* dL/d|X| combined linear+log, averaged over bins AND
+                 * frames AND scales: L = 0.5·Σ(Δlin+Δlog)/(nbins·n_frames
+                 * ·n_scales) so the gradient must carry the same.
+                 * The log term's 1/la explodes at spectral nulls (la→0);
+                 * cap it at 10 so null bins don't dominate the gradient
+                 * (matches how production spectral losses floor the log
+                 * magnitude term). */
+                float dlog_g = (la > lb ? 1.0f : -1.0f) / la;
+                if (dlog_g > 10.0f) dlog_g = 10.0f;
+                if (dlog_g < -10.0f) dlog_g = -10.0f;
+                /* WUBU_SPEC_LINONLY=1: verify the linear term alone (the
+                 * log term's 1/la at spectral nulls is mathematically
+                 * correct but makes FD checks ill-conditioned). */
+                if (getenv("WUBU_SPEC_LINONLY")) dlog_g = 0.0f;
+                float dm = 0.5f * ((ma > mb ? 1.0f : -1.0f) + dlog_g)
+                           / ((float)nbins * (float)n_frames * (float)n_scales);
+                /* d|X|/dx[n] = (Re·cosθ + Im·sinθ)/|X| — direct (verified
+                 * by finite difference: PLUS sign, not minus) */
+                if (ma > 1e-12f) {
+                    for (int t = 0; t < w; t++) {
+                        int idx = start + t;
+                        if (idx >= n) continue;
+                        float ph = -2.0f * (float)M_PI * (float)b * (float)t / (float)w;
+                        grad_out[idx] += dm * (re_a[b] * cosf(ph) + im_a[b] * sinf(ph)) / ma
+                                        * win[t];
+                    }
+                }
+            }
+            free(mag_b);
+            scale_loss += 0.5f * (dsum / (float)nbins + dlog / (float)nbins);
+        }
+
+        total_loss += (float)(scale_loss / (double)n_frames);
+        free(win); free(frame_a); free(frame_b); free(re_a); free(im_a);
     }
     return total_loss / (float)n_scales;
 }
@@ -1016,15 +1147,48 @@ int wubu_train_step(WuBuRVCModel *model, WuBuTrainRegistry *reg, WuBuAdamW *opt,
 
     int n = n_out < n_samples ? n_out : n_samples;
     float mse = wubu_mse_loss(audio, wav, n);
-    if (loss_out) *loss_out = mse;
-    model->last_loss = mse;
+
+    /* Spectral supervision (Qwen3-TTS/HiFi-GAN recipe): multi-scale STFT
+     * linear+log magnitude loss. Its gradient flows through the IFFT into
+     * d_audio, so the weights learn to keep harmonics/formants sharp —
+     * MSE alone washes them out. λ = spectral_weight (default 1.0, tuned
+     * so the spectral gradient RMS ≈ 0.5× the MSE gradient RMS). */
+    float spectral_weight = 1.0f;
+    const char *sw = getenv("WUBU_SPECTRAL_WEIGHT");
+    if (sw) spectral_weight = (float)atof(sw);
+    float spec_loss = 0.0f;
+    float *d_spec = NULL;
+    if (spectral_weight > 0.0f && n > 128) {
+        d_spec = (float *)malloc((size_t)n_out * sizeof(float));
+        if (d_spec) {
+            spec_loss = wubu_stft_loss_grad(audio, wav, n, 40000, d_spec, 3);
+            /* scale the spectral gradient into the MSE-gradient ballpark */
+            float gnorm = 0.0f;
+            for (int i = 0; i < n; i++) gnorm += d_spec[i] * d_spec[i];
+            gnorm = sqrtf(gnorm / (float)n);
+            if (gnorm > 1e-9f && mse > 1e-12f) {
+                /* target spectral grad RMS = 0.5 × MSE grad RMS =
+                 * 0.5 · (2·sqrt(mse)/n) */
+                float scale = spectral_weight * 0.5f * (2.0f / (float)n) * sqrtf(mse) / gnorm;
+                for (int i = 0; i < n; i++) d_spec[i] *= scale;
+            } else {
+                for (int i = 0; i < n; i++) d_spec[i] = 0.0f;
+            }
+        }
+    }
+
+    float total_loss = mse + spec_loss;
+    if (loss_out) *loss_out = total_loss;
+    model->last_loss = total_loss;
     model->last_epoch = epoch;
 
-    /* dL/daudio for MSE = 2*(audio - wav)/n */
+    /* dL/daudio for MSE = 2*(audio - wav)/n, plus the spectral gradient */
     float *d_audio = (float *)malloc((size_t)n_out * sizeof(float));
-    if (!d_audio) { free(audio); decoder_cache_free(&cache); return -1; }
-    for (int i = 0; i < n; i++)
+    if (!d_audio) { free(d_spec); free(audio); decoder_cache_free(&cache); return -1; }
+    for (int i = 0; i < n; i++) {
         d_audio[i] = 2.0f * (audio[i] - wav[i]) / (float)n;
+        if (d_spec) d_audio[i] += d_spec[i];
+    }
     for (int i = n; i < n_out; i++)
         d_audio[i] = 0.0f;
 
@@ -1035,10 +1199,11 @@ int wubu_train_step(WuBuRVCModel *model, WuBuTrainRegistry *reg, WuBuAdamW *opt,
     for (int i = 0; i < reg->count; i++)
         wubu_adamw_step(opt, i, reg->params[i].data, reg->params[i].grad);
 
+    free(d_spec);
     free(d_audio);
     free(audio);
     decoder_cache_free(&cache);
-    return (mse < 0.1f) ? 1 : 0;
+    return (total_loss < 0.1f) ? 1 : 0;
 }
 
 float wubu_train_gradcheck(WuBuRVCModel *model, WuBuTrainRegistry *reg,

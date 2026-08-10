@@ -22,9 +22,33 @@
 #include <immintrin.h>
 #include <omp.h>
 
+/* Thread-local xorshift32 PRNG for NSF noise injection.
+ * The old rand() was (a) unseeded — same noise every run — and (b) not
+ * thread-safe across the chunk workers. torch.randn in the original RVC is
+ * freshly seeded per process, so each conversion gets natural stochastic
+ * posterior + sine dither. Seeded from time + thread id. */
+static _Thread_local uint32_t wubu_rng_state = 0;
+
+static inline uint32_t wubu_rng_next(void) {
+    uint32_t x = wubu_rng_state;
+    if (x == 0) {
+        /* first call in this thread: seed from time + thread */
+        unsigned long t = (unsigned long)time(NULL) ^
+                          ((unsigned long)(uintptr_t)&wubu_rng_state ^ 0x9E3779B9u);
+        x = (uint32_t)(t ^ (t >> 16));
+        if (x == 0) x = 0x12345678u;
+        wubu_rng_state = x;
+    }
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    wubu_rng_state = x;
+    return x;
+}
+
 /* Uniform random in [lo, hi) — used for NSF noise injection */
 static inline float wubu_rand_uniform(float lo, float hi) {
-    return lo + (hi - lo) * ((float)rand() / (float)RAND_MAX);
+    return lo + (hi - lo) * ((float)(wubu_rng_next() >> 8) / 16777216.0f);
 }
 
 /* ═══════════════════════ basic tensor helpers ═══════════════════════*/
@@ -1436,13 +1460,25 @@ int wubu_generator_nsf(WuBuRVCModel *model,
                                             : sinf(2.0f * (float)M_PI * phase)) * 0.1f;  /* sine_amp = 0.1 */
             float sv = (nsff0[fi] > 0) ? 1.0f : 0.0f;  /* uv mask */
             /* Phase 4 improvement: noise injection in NSF sine generation.
-             * PyTorch SineGen injects uniform noise in unvoiced regions:
-             *   noise_amp = (1 - uv) * sine_amp / 3 = (1 - uv) * 0.0333
-             * This adds natural breathiness/silence texture. For parity mode
-             * (randn_scale=0), noise is suppressed. */
-            float noise_amp = inject_noise ? (1.0f - sv) * 0.1f / 3.0f : 0.0f;
-            float noise = noise_amp * wubu_rand_uniform(-1.0f, 1.0f);
-            float sw = s * sv + noise;                     /* sine * uv + noise * (1-uv) */
+             * PyTorch SineGen (models.py:340) adds Gaussian noise to BOTH:
+             *   noise_amp = uv * noise_std + (1 - uv) * sine_amp / 3
+             *            = uv * 0.003 + (1 - uv) * 0.0333
+             *   noise = noise_amp * torch.randn_like(sine_waves)
+             *   sine_waves = sine_waves * uv + noise
+             * So VOICED frames get tiny 0.003 Gaussian dither (kills the
+             * 'pure sine' metallic/robotic tone) and UNVOICED frames get
+             * 0.0333 Gaussian breath texture. For parity mode
+             * (randn_scale=0 / inject_noise=0) noise is suppressed. */
+            float noise_amp = inject_noise ? (sv * 0.003f + (1.0f - sv) * 0.1f / 3.0f) : 0.0f;
+            /* Gaussian via Irwin-Hall (sum of 12 U(-1,1)) — matches the
+             * z_p noise; torch.randn is N(0,1) not uniform. */
+            float g = 0.0f;
+            if (noise_amp > 0.0f) {
+                for (int _u = 0; _u < 12; _u++)
+                    g += wubu_rand_uniform(-1.0f, 1.0f);
+                g *= noise_amp;
+            }
+            float sw = s * sv + g;                     /* sine * uv + noise */
             sine[j] = (wubu_get_fast_math() ? wubu_fasttanh(linw * sw + linb)
                                             : tanhf(linw * sw + linb));  /* l_linear + tanh */
         }
@@ -1823,10 +1859,11 @@ int wubu_rvc_synthesize_real(WuBuRVCModel *model,
             }
             z_p[(size_t)c * n_frames + j] =
                 (m[(size_t)c * n_frames + j] + (wubu_get_fast_math() ? wubu_fastexp(logs[(size_t)c * n_frames + j]) : expf(logs[(size_t)c * n_frames + j])) * r) * x_mask[j];
-            /* Clamp z_p to [-3, 3] (3 sigma for N(0,1) with noise_scale ~0.5).
-             * Prevents extreme values that saturate the tanh output. */
-            if (z_p[(size_t)c * n_frames + j] > 3.0f) z_p[(size_t)c * n_frames + j] = 3.0f;
-            if (z_p[(size_t)c * n_frames + j] < -3.0f) z_p[(size_t)c * n_frames + j] = -3.0f;
+            /* NOTE: NO clamp on z_p. The original RVC (models.py) does not
+             * clamp — z_p = (m + exp(logs)*randn*0.66666) * x_mask. An
+             * earlier [-3,3] clamp here walled the stochastic posterior and
+             * made phonetics robotic. The flow's final tanh saturates
+             * naturally; the generator expects the full distribution. */
         }
     }
 

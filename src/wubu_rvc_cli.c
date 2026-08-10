@@ -324,7 +324,9 @@ int main(int argc, char **argv) {
     char index_path[1024] = {0};
     char hubert_path[1024] = {0};
     int speaker_id = 0;       /* default: speaker 0 */
-    float noise_scale = 0.0f; /* default: deterministic (parity mode) */
+    float noise_scale = 0.66666f; /* default: RVC reference stochastic posterior
+                                     (models.py hardcodes * 0.66666 in z_p).
+                                     0.0 = deterministic (parity/debug mode) */
     int preset = 0;           /* 0 = none, 1-4 = character preset */
     int use_snake = 0;        /* 0 = LeakyReLU (original), 1 = Snake (BigVGAN) */
     float formant_shift = 1.0f; /* 1.0 = no shift */
@@ -660,6 +662,51 @@ int main(int argc, char **argv) {
             printf("[5] yin f0 frames: %d\n", n_f0);
         }
         if (rm) wubu_rmvpe_free(rm);
+        /* ── RVC-exact: interpolate f0 through unvoiced holes ──
+         * The original pipeline's get_f0 does:
+         *   uv = f0 == 0
+         *   f0[uv] = np.interp(where(uv), where(~uv), f0[~uv])
+         * BEFORE coarse binning and BEFORE the fine f0 (nsff0) reaches the
+         * generator. Consequence: the generator's _f02uv(f0>0) mask is
+         * essentially ALWAYS voiced, so the sine excitation stays continuous
+         * through consonants and the breath/voicing texture is carried by the
+         * noise_convs + the tiny uv*noise_std dither — NOT by zeroing the
+         * sine. Leaving zeros here made the excitation drop out on unvoiced
+         * frames = robotic consonants. */
+        {
+            int *uv_idx = (int *)malloc((size_t)(n_f0 + 1) * sizeof(int));
+            int *vo_idx = (int *)malloc((size_t)(n_f0 + 1) * sizeof(int));
+            if (uv_idx && vo_idx) {
+                int nu = 0, nv = 0;
+                for (int j = 0; j < n_f0; j++) {
+                    if (f0[j] <= 0.0f) uv_idx[nu++] = j;
+                    else vo_idx[nv++] = j;
+                }
+                if (nu > 0 && nv > 0) {
+                    /* linear interpolation over voiced anchors (np.interp) */
+                    for (int k = 0; k < nu; k++) {
+                        int j = uv_idx[k];
+                        /* find bracketing voiced indices */
+                        int a = -1, b = -1;
+                        for (int t = 0; t < nv; t++) if (vo_idx[t] < j) a = vo_idx[t];
+                        for (int t = nv - 1; t >= 0; t--) if (vo_idx[t] > j) b = vo_idx[t];
+                        float va = a >= 0 ? f0[a] : f0[vo_idx[0]];
+                        float vb = b >= 0 ? f0[b] : f0[vo_idx[nv - 1]];
+                        if (a >= 0 && b >= 0) {
+                            f0[j] = va + (vb - va) * (float)(j - a) / (float)(b - a);
+                        } else if (a >= 0) {
+                            f0[j] = va;
+                        } else if (b >= 0) {
+                            f0[j] = vb;
+                        } else {
+                            f0[j] = 0.0f;
+                        }
+                    }
+                    printf("[5] f0 interpolated through %d unvoiced frames (RVC get_f0 semantics)\n", nu);
+                }
+                free(uv_idx); free(vo_idx);
+            }
+        }
         if (getenv("WUBU_DUMP_F0")) {
             FILE *df = fopen("f0_ours.bin", "wb");
             if (df) { fwrite(f0, sizeof(float), (size_t)n_f0, df); fclose(df); }

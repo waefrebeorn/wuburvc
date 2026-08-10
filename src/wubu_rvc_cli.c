@@ -44,6 +44,7 @@
 #include <dirent.h>
 #include "wubu_postproc.h"
 #include "wubu_harmony.h"
+#include "wubu_consonant.h"
 
 static void die(const char *msg) { fprintf(stderr, "wubu_rvc_cli: %s\n", msg); exit(1); }
 
@@ -160,6 +161,7 @@ typedef struct {
     const float *pcm16; int n16;
     const int *f0_coarse; const float *nsff0; int n_f0;
     const float *harmony_f0; const float *harmony_gain; int n_harmony;
+    const float *uv_mask; int n_uv;
     const WuBuHubert *hb; int rvc_ver; int content_dim;
     WuBuRVCModel *model; int speaker_id; float noise_scale; int use_snake;
     int ups_total;
@@ -278,7 +280,9 @@ static void *chunk_worker(void *arg) {
                                                  ? ctx->harmony_f0 + f0_start : NULL,
                                              (ctx->harmony_f0 && ctx->harmony_gain &&
                                               f0_start < ctx->n_harmony)
-                                                 ? ctx->harmony_gain + f0_start : NULL);
+                                                 ? ctx->harmony_gain + f0_start : NULL,
+                                             (ctx->uv_mask && f0_start < ctx->n_uv)
+                                                 ? ctx->uv_mask + f0_start : NULL);
         free(cmaj);
         if (n_out <= 0) { free(aout); ctx->rc[c] = -1; continue; }
         ctx->audio[c] = aout;
@@ -346,6 +350,7 @@ int main(int argc, char **argv) {
     float index_rate = 0.78f; /* --index-rate R: FAISS retrieval blend (RVC default 0.78) */
     float protect = 0.33f;    /* --protect P: voiceless-consonant protection (RVC default 0.33) */
     int harmony = 1;          /* --harmony 0/1: dual-fundamental detection + sine injection */
+    int consonant_uv = 1;     /* --consonant 0/1: spectral-flatness uv mask (noise excitation on unvoiced) */
     int autokey_probe = 0;    /* --autokey N: auto key adaptation (N = probe secs) */
     float chunk_secs = 3.0f;  /* --chunk F: chunked inference (3s default; 0 = whole-track) */
     float ctx_secs = 0.72f;   /* --ctx F: HuBERT context window in seconds
@@ -415,6 +420,9 @@ int main(int argc, char **argv) {
             a++;
         } else if (strcmp(argv[a], "--harmony") == 0) {
             harmony = atoi(argv[a + 1]);
+            a++;
+        } else if (strcmp(argv[a], "--consonant") == 0) {
+            consonant_uv = atoi(argv[a + 1]);
             a++;
         } else if (strcmp(argv[a], "--autokey") == 0) {
             autokey_probe = atoi(argv[a + 1]);
@@ -786,6 +794,30 @@ int main(int argc, char **argv) {
     }
     free(f0);
 
+    /* 5b2. consonant voicing mask — spectral-flatness uv detection.
+     * RVC's get_f0 interpolates f0 through unvoiced holes, so the generator
+     * would label ~everything voiced (sine buzz on s/sh/f). The flatness
+     * mask restores the true voiced/unvoiced boundary: unvoiced frames get
+     * noise excitation (source-filter SOTA). */
+    float *uv_mask = NULL;
+    int n_uv = 0;
+    if (consonant_uv && n_f0_2 > 0) {
+        uv_mask = (float *)calloc((size_t)(n_f0_2 + 2), sizeof(float));
+        if (uv_mask) {
+            t0 = clock();
+            int ug = wubu_consonant_uv(pcm16, n16, 16000, nsff0, n_f0_2,
+                                       uv_mask, NULL, 1024, 160);
+            n_uv = ug;
+            if (ug > 0) {
+                int vc = 0;
+                for (int j = 0; j < ug; j++) if (uv_mask[j] > 0.5f) vc++;
+                printf("[5b2] consonant uv: %d/%d frames voiced (%.0f%%), %.2f s\n",
+                       vc, ug, 100.0 * vc / ug,
+                       (double)(clock() - t0) / CLOCKS_PER_SEC);
+            }
+        }
+    }
+
     /* 5c. harmony detection — dual fundamental (polyphonic) pitch.
      * Runs on the 16k PCM with the f0 contour as the continuity anchor.
      * Produces per-frame harmony_f0[] (Hz, 0 = monophonic) + gain[] used
@@ -839,6 +871,7 @@ int main(int argc, char **argv) {
         ctx.pcm16 = pcm16; ctx.n16 = n16;
         ctx.f0_coarse = f0_coarse; ctx.nsff0 = nsff0; ctx.n_f0 = n_f0_2;
         ctx.harmony_f0 = harmony_f0; ctx.harmony_gain = harmony_gain; ctx.n_harmony = n_harmony;
+        ctx.uv_mask = uv_mask; ctx.n_uv = n_uv;
         ctx.hb = &hb; ctx.rvc_ver = rvc_ver; ctx.content_dim = content_dim;
         ctx.model = rvc->model; ctx.speaker_id = speaker_id;
         ctx.noise_scale = noise_scale; ctx.use_snake = use_snake;
@@ -953,7 +986,7 @@ int main(int argc, char **argv) {
     n_out = wubu_rvc_synthesize_real(rvc->model, cmaj, n_frames, content_dim,
                                      f0_coarse, nsff0, speaker_id, noise_scale,
                                      out_audio, max_audio, use_snake,
-                                     harmony_f0, harmony_gain);
+                                     harmony_f0, harmony_gain, uv_mask);
     synth_s = (double)(clock() - t0) / CLOCKS_PER_SEC;
     if (n_out <= 0) die("synth failed");
 
@@ -975,7 +1008,7 @@ int main(int argc, char **argv) {
         n_out = wubu_rvc_synthesize_real(rvc->model, cmaj, n_frames, content_dim,
                                          f0_coarse, nsff0, speaker_id, noise_scale,
                                          out_audio, max_audio, use_snake,
-                                         harmony_f0, harmony_gain);
+                                         harmony_f0, harmony_gain, uv_mask);
         synth_s = (double)(clock() - t0) / CLOCKS_PER_SEC;
         if (n_out <= 0) die("synth failed (LeakyReLU fallback)");
     }
@@ -1086,7 +1119,7 @@ int main(int argc, char **argv) {
            (double)n_out / sr_out);
 
     free(pcm16); free(f0_coarse); free(nsff0); free(out_audio);
-    free(harmony_f0); free(harmony_gain);
+    free(harmony_f0); free(harmony_gain); free(uv_mask);
     free(audio);
     wubu_hubert_free(&hb);
     wubu_rvc_destroy(rvc);

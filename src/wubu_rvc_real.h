@@ -65,7 +65,8 @@ int wubu_rvc_synthesize_real(WuBuRVCModel *model,
                              int sid, float randn_scale,
                              float *out_audio, int max_samples,
                              int use_snake,
-                             const float *harmony_f0, const float *harmony_gain);
+                             const float *harmony_f0, const float *harmony_gain,
+                             const float *uv_mask);
 
 /* GPU generator variant (wubu_rvc_cuda.cu): flow on CPU, GeneratorNSF on CUDA. */
 int wubu_rvc_synthesize_real_cuda(WuBuRVCModel *model,
@@ -112,14 +113,20 @@ int wubu_flow_reverse(WuBuRVCModel *model,
  * blend 0..1 for polyphonic harmony vocals. When harmony_f0[j] > 0 the sine
  * excitation carries BOTH the lead pitch and the harmony pitch (weighted by
  * harmony_gain), so the generator renders two simultaneous tones without
- * retraining. Pass NULL/0 to disable (monophonic = current behavior). */
+ * retraining. Pass NULL/0 to disable (monophonic = current behavior).
+ * uv_mask: optional per-frame voiced/unvoiced mask (1=voiced, 0=unvoiced)
+ * from spectral flatness (wubu_consonant_uv). When present, unvoiced frames
+ * get NOISE excitation (sine gated off, breath/frication noise on) instead
+ * of the interpolated-pitch sine — the source-filter SOTA fix for mixed-up
+ * consonants. Pass NULL to derive uv from nsff0>0 (legacy behavior). */
 int wubu_generator_nsf(WuBuRVCModel *model,
                        const float *z, int n_frames, int inter_channels,
                        const float *nsff0, const float *g,
                        float *out, int max_samples,
                        int inject_noise,
                        int use_snake,
-                       const float *harmony_f0, const float *harmony_gain);
+                       const float *harmony_f0, const float *harmony_gain,
+                       const float *uv_mask);
 
 #ifdef __cplusplus
 }

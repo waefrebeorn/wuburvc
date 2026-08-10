@@ -1296,7 +1296,8 @@ int wubu_generator_nsf(WuBuRVCModel *model,
                        float *out, int max_samples,
                        int inject_noise,
                        int use_snake,
-                       const float *harmony_f0, const float *harmony_gain)  /* BigVGAN Snake activation in MRF blocks */
+                       const float *harmony_f0, const float *harmony_gain,
+                       const float *uv_mask)  /* BigVGAN Snake activation in MRF blocks */
 {
     const int profiling = getenv("WUBU_TIME_STAGES") != NULL;
     double t_convT = 0.0, t_mrf = 0.0, t_noise = 0.0, t_other = 0.0;
@@ -1503,6 +1504,19 @@ int wubu_generator_nsf(WuBuRVCModel *model,
                 s += hs * hg;
             }
             float sv = (nsff0[fi] > 0) ? 1.0f : 0.0f;  /* uv mask */
+            /* Consonant fix (source-filter SOTA): when a spectral-flatness
+             * uv mask is provided, use IT for the voiced/unvoiced decision
+             * instead of nsff0>0. RVC's get_f0 interpolates f0 through
+             * unvoiced holes, so nsff0 is ~always > 0 and the legacy mask
+             * labels EVERYTHING voiced — unvoiced consonants then get a
+             * sine buzz instead of the noise excitation the vocoder was
+             * trained on. With the flatness mask, unvoiced frames (s/sh/f,
+             * plosives, breath) gate the sine OFF and the noise_amp branch
+             * (0.0333 Gaussian) carries the frication. */
+            if (uv_mask) {
+                float uvj = uv_mask[fi];
+                sv = (uvj > 0.5f) ? 1.0f : 0.0f;
+            }
             /* Phase 4 improvement: noise injection in NSF sine generation.
              * PyTorch SineGen (models.py:340) adds Gaussian noise to BOTH:
              *   noise_amp = uv * noise_std + (1 - uv) * sine_amp / 3
@@ -1843,7 +1857,8 @@ int wubu_rvc_synthesize_real(WuBuRVCModel *model,
                              int sid, float randn_scale,
                              float *out_audio, int max_samples,
                              int use_snake,
-                             const float *harmony_f0, const float *harmony_gain) {
+                             const float *harmony_f0, const float *harmony_gain,
+                             const float *uv_mask) {
     if (!model || !content || !out_audio || n_frames < 1) return -1;
 
     const RVCTensor *emb_g = T(model, "emb_g.weight");
@@ -1929,7 +1944,7 @@ int wubu_rvc_synthesize_real(WuBuRVCModel *model,
      * function (0.1 * sin^2 term) compensates for this. */
     int n_out = wubu_generator_nsf(model, z, n_frames, inter, nsff0, g,
                                    out_audio, max_samples, randn_scale > 0.0f, use_snake,
-                                   harmony_f0, harmony_gain);
+                                   harmony_f0, harmony_gain, uv_mask);
 
     free(m); free(logs); free(x_mask); free(z_p); free(z);
     return n_out;

@@ -1444,17 +1444,33 @@ int wubu_generator_nsf(WuBuRVCModel *model,
          *         rad_acc[t] = fmod(sum(carry[0..t]), 1.0) */
         float *carry = (float *)malloc((size_t)nF * sizeof(float));
         float *rad_acc = (float *)malloc((size_t)nF * sizeof(float));
+        float *shim_arr = (float *)malloc((size_t)nF * sizeof(float));
         float *hcarry = hrad ? (float *)malloc((size_t)nF * sizeof(float)) : NULL;
         float *hrad_acc = hrad ? (float *)malloc((size_t)nF * sizeof(float)) : NULL;
-        if (!carry || !rad_acc || (hrad && (!hcarry || !hrad_acc))) {
-            free(hrad_acc); free(hcarry); free(carry); free(rad_acc); free(hrad); free(rad); free(sine); free(x); return -1;
+        if (!carry || !rad_acc || !shim_arr || (hrad && (!hcarry || !hrad_acc))) {
+            free(hrad_acc); free(hcarry); free(shim_arr); free(carry); free(rad_acc); free(hrad); free(rad); free(sine); free(x); return -1;
         }
         float accum = 0.0f, haccum = 0.0f;
+        /* Jitter/shimmer injection (Triple-DA gap 1.1, source-filter SOTA):
+         * human voice has cycle-to-cycle period (jitter) and amplitude
+         * (shimmer) variation; a pure sine has none → robotic timbre on
+         * held vowels. Add a small per-frame period modulation (±0.15%
+         * voiced, gated by inject_noise so --noise 0 stays bit-exact) and
+         * per-frame amplitude shimmer (±2%) via the phase accumulator. */
+        float jit_amp = (inject_noise) ? 0.005f : 0.0f;   /* ±0.5% period (natural jitter range 0.5–1.5%) */
+        float shim_amp = (inject_noise) ? 0.03f : 0.0f;   /* ±3% amplitude (natural shimmer 2–8%) */
         for (int t = 0; t < nF; t++) {
-            carry[t] = rad[t] * (float)ups_total;
+            float jit = 0.0f, shim = 1.0f;
+            if (jit_amp > 0.0f && nsff0[t] > 40.0f) {
+                /* jitter: modulate the instantaneous period */
+                jit = wubu_rand_uniform(-jit_amp, jit_amp);
+                shim = 1.0f + wubu_rand_uniform(-shim_amp, shim_amp);
+            }
+            carry[t] = rad[t] * (float)ups_total * (1.0f + jit);
             float rad2 = fmodf(carry[t] + 0.5f, 1.0f) - 0.5f;
             accum += rad2;
             rad_acc[t] = fmodf(accum, 1.0f);  /* cumulative carry, mod 1 */
+            shim_arr[t] = shim;
             if (hrad) {
                 hcarry[t] = hrad[t] * (float)ups_total;
                 float hrad2 = fmodf(hcarry[t] + 0.5f, 1.0f) - 0.5f;
@@ -1495,6 +1511,11 @@ int wubu_generator_nsf(WuBuRVCModel *model,
              * instead of 1.0). */
             float s = (wubu_get_fast_math() ? wubu_sinf_folded(2.0f * (float)M_PI * phase)
                                             : sinf(2.0f * (float)M_PI * phase)) * 0.1f;  /* sine_amp = 0.1 */
+            /* Shimmer (Triple-DA gap 1.1): per-frame amplitude modulation
+             * ±2% on voiced frames — the natural amplitude variation a
+             * pure sine lacks. shim_arr is 1.0 on unvoiced/silence so the
+             * breath/frication noise branch is untouched. */
+            if (shim_arr && shim_arr[fi] != 1.0f) s *= shim_arr[fi];
             if (hg > 0.0f) {
                 float hs = (wubu_get_fast_math() ? wubu_sinf_folded(2.0f * (float)M_PI * harm_phase)
                                                  : sinf(2.0f * (float)M_PI * harm_phase)) * 0.1f;
@@ -1564,7 +1585,7 @@ int wubu_generator_nsf(WuBuRVCModel *model,
             sine[j] = (wubu_get_fast_math() ? wubu_fasttanh(linw * sw + linb)
                                             : tanhf(linw * sw + linb));  /* l_linear + tanh */
         }
-        free(carry); free(rad_acc); free(rad);
+        free(carry); free(rad_acc); free(rad); free(shim_arr);
         free(hcarry); free(hrad_acc); free(hrad);
     }
     if (getenv("WUBU_RVC_DUMP")) {

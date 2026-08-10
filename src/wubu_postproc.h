@@ -42,6 +42,15 @@ void wubu_post_process(const float *input, float *output, int n, int sr,
 void wubu_apply_character_preset(const float *input, float *output, int n, int sr,
                                  int preset);
 
+/* ── Artifact spectral gate (AF-Vocoder concept, Interspeech 2025) ──
+ * Neural vocoders occasionally emit spectral-outlier frames (flat noisy
+ * bursts, "digital" clatter) that read as robotic. AF-Vocoder filters them
+ * with a learned GAFilter; we approximate with a cheap DSP gate: per-frame
+ * spectral flatness + HNR — frames that are BOTH noise-like AND isolated
+ * (neighbors are harmonic) get a soft-knee attenuation. In-place safe.
+ * strength: 0 = off, 0.3 typical (max 1.0). */
+void wubu_artifact_gate(float *audio, int n, int sr, float strength);
+
 /* ── Formant shifting (gender conversion) ──
  * Shifts formant frequencies to make voice sound more masculine or feminine
  * without changing pitch. Uses phase-vocoder-based time/pitch separable processing.

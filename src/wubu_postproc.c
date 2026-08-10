@@ -16,6 +16,7 @@
 
 #define _USE_MATH_DEFINES
 #include "wubu_postproc.h"
+#include "wubu_fft.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -245,25 +246,52 @@ void wubu_formant_shift(const float *input, float *output, int n, int sr,
 void wubu_f0_smooth(float *f0, int n, float strength) {
     if (!f0 || n <= 0 || strength <= 0) return;
     float *smoothed = (float *)malloc((size_t)n * sizeof(float));
-    if (!smoothed) return;
+    float *slow = (float *)malloc((size_t)n * sizeof(float));
+    float *vib = (float *)malloc((size_t)n * sizeof(float));
+    if (!smoothed || !slow || !vib) {
+        free(smoothed); free(slow); free(vib); return;
+    }
+
+    /* Vibrato-aware smoothing (VibE-SVC, arXiv:2605.20794): vibrato is a
+     * separable HIGH-FREQUENCY component of the f0 contour (4-7 Hz = period
+     * ~15-25 frames @100fps). Naive smoothing (old code) destroyed it and
+     * then injected a FAKE fixed-rate sine — phase-locked to the frame
+     * index, ignoring the singer's real vibrato. Instead:
+     *   1. slow   = heavy moving average (the pitch "carrier")
+     *   2. vib    = median-3 minus slow  (the singer's actual vibrato,
+     *               which survives the slow MA but frame-to-frame tracking
+     *               jitter is removed by the median)
+     *   3. out    = slow + vib, blended by strength against the original
+     * So tracking jitter is smoothed but the singer's natural vibrato is
+     * PRESERVED at its original depth/frequency. */
+    const int MA = 5;   /* 50 ms @100fps — passes 4-7 Hz vibrato, kills jitter */
+    for (int i = 0; i < n; i++) {
+        if (f0[i] <= 0) { slow[i] = 0; vib[i] = 0; continue; }
+        /* moving average over voiced neighbors only */
+        float acc = 0; int cnt = 0;
+        for (int k = -MA; k <= MA; k++) {
+            int j = i + k;
+            if (j >= 0 && j < n && f0[j] > 0) { acc += f0[j]; cnt++; }
+        }
+        slow[i] = cnt > 0 ? acc / cnt : f0[i];
+        /* median-3 of the original (kills single-frame jitter, keeps
+         * slower vibrato) */
+        float l = (i > 0 && f0[i-1] > 0) ? f0[i-1] : f0[i];
+        float r = (i < n-1 && f0[i+1] > 0) ? f0[i+1] : f0[i];
+        float c = f0[i];
+        float med = (l <= c) ? ((c <= r) ? c : (l > r ? l : r))
+                             : ((l <= r) ? l : (c > r ? c : r));
+        vib[i] = med - slow[i];   /* actual vibrato + low-freq drift */
+    }
+
     for (int i = 0; i < n; i++) {
         if (f0[i] <= 0) { smoothed[i] = 0; continue; }
-        float c = f0[i];
-        float l = (i > 0 && f0[i-1] > 0) ? f0[i-1] : c;
-        float r = (i < n-1 && f0[i+1] > 0) ? f0[i+1] : c;
-        smoothed[i] = (1 - strength) * c + strength * (0.5f * c + 0.25f * l + 0.25f * r);
+        float target = slow[i] + vib[i];   /* jitter removed, vibrato kept */
+        smoothed[i] = (1.0f - strength) * f0[i] + strength * target;
     }
-    if (strength > 0.5f) {
-        float vib_depth = (strength - 0.5f) * 0.02f;
-        for (int i = 0; i < n; i++) {
-            if (smoothed[i] > 0) {
-                float vib = 1.0f + vib_depth * sinf(0.2f * i);
-                smoothed[i] *= vib;
-            }
-        }
-    }
+
     memcpy(f0, smoothed, (size_t)n * sizeof(float));
-    free(smoothed);
+    free(smoothed); free(slow); free(vib);
 }
 
 void wubu_adaptive_feature_blend(const float *src_feat, const float *ref_feat,
@@ -373,4 +401,87 @@ void wubu_rms_mix_rate(const float *input, float *output, int n, int sr,
     }
     free(env_in);
     free(env_out);
+}
+
+/* ── Artifact spectral gate (AF-Vocoder concept) ──
+ * Vocoder artifact frames are spectral outliers: flat (noise-like) AND
+ * isolated (harmonic neighbors). Detect per-frame Wiener entropy + HNR;
+ * a frame that is flat while BOTH neighbors are harmonic gets a soft-knee
+ * attenuation (it's a digital clatter burst, not a real fricative —
+ * real fricatives come in runs). In-place safe. */
+void wubu_artifact_gate(float *audio, int n, int sr, float strength) {
+    if (!audio || n <= 0 || sr <= 0 || strength <= 0.0f) return;
+    const int win = 512, hop = 128;   /* 10.7ms frame @48k — bursts dominate */
+    if (n < win) return;
+    int n_frames = (n - win) / hop + 1;
+    if (n_frames < 3) return;
+
+    float *flat = (float *)malloc((size_t)n_frames * sizeof(float));
+    float *gains = (float *)malloc((size_t)n_frames * sizeof(float));
+    if (!flat || !gains) { free(flat); free(gains); return; }
+
+    /* per-frame flatness (Wiener entropy) via proper FFT */
+    int nfft = 512;
+    WuBuCpx *spec = (WuBuCpx *)malloc((size_t)nfft * sizeof(WuBuCpx));
+    float *hann = (float *)malloc((size_t)win * sizeof(float));
+    if (!spec || !hann) { free(spec); free(hann); free(flat); free(gains); return; }
+    for (int i = 0; i < win; i++)
+        hann[i] = 0.5f * (1.0f - cosf(2.0f * (float)M_PI * i / (float)(win - 1)));
+    for (int f = 0; f < n_frames; f++) {
+        memset(spec, 0, (size_t)nfft * sizeof(WuBuCpx));
+        for (int i = 0; i < win; i++)
+            spec[i].re = audio[f * hop + i] * hann[i];
+        wubu_fft(spec, nfft, 0);
+        double sum_log = 0, sum_mag = 0;
+        int valid = 0;
+        for (int b = 1; b < nfft / 2; b++) {
+            double m = sqrt(spec[b].re * spec[b].re + spec[b].im * spec[b].im);
+            if (m > 1e-9) { sum_log += log(m); sum_mag += m; valid++; }
+        }
+        float flatness = 1.0f;
+        if (valid > 1 && sum_mag > 1e-9) {
+            double geo = exp(sum_log / valid);
+            double arith = sum_mag / valid;
+            flatness = (float)(geo / (arith + 1e-12));
+            if (flatness < 0) flatness = 0;
+            if (flatness > 1) flatness = 1;
+        }
+        flat[f] = flatness;
+    }
+    free(spec); free(hann);
+    /* gate: SHORT flat runs get attenuated, LONG flat runs survive.
+     * Discriminator (AF-Vocoder insight): a real fricative/consonant is a
+     * sustained noise run (100-300 ms); a vocoder artifact is a short
+     * digital clatter burst (10-50 ms). At hop=128 @48k = 2.67 ms/frame,
+     * that means artifacts are <= ~18 frames, fricatives >= ~37 frames.
+     * Use 15 frames (~40 ms) as the cutoff — a wide margin above real
+     * fricatives, safely below long clatter. */
+    const int MAX_ARTIFACT_RUN = 15;
+    for (int f = 0; f < n_frames; f++) gains[f] = 1.0f;
+    for (int f = 0; f < n_frames; ) {
+        if (flat[f] < 0.65f) { f++; continue; }
+        int run_start = f;
+        while (f < n_frames && flat[f] >= 0.65f) f++;
+        int run_len = f - run_start;
+        if (run_len >= 1 && run_len <= MAX_ARTIFACT_RUN) {
+            /* short clatter burst — attenuate */
+            for (int i = run_start; i < f; i++) {
+                float depth = (flat[i] - 0.65f) / 0.35f;
+                if (depth > 1) depth = 1;
+                if (depth < 0) depth = 0;
+                gains[i] = 1.0f - strength * depth;
+            }
+        }
+        /* runs > MAX_ARTIFACT_RUN: real fricative, leave alone */
+    }
+    /* apply with linear interpolation between frames (no clicks) */
+    for (int i = 0; i < n; i++) {
+        double pos = (double)i / hop;
+        int f0 = (int)pos;
+        if (f0 >= n_frames - 1) f0 = n_frames - 2;
+        double frac = pos - f0;
+        float g = (float)(gains[f0] + (gains[f0 + 1] - gains[f0]) * frac);
+        audio[i] *= g;
+    }
+    free(flat); free(gains);
 }

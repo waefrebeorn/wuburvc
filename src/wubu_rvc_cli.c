@@ -351,6 +351,7 @@ int main(int argc, char **argv) {
     int force_yin = 0;        /* --f0 yin: force YIN instead of RMVPE */
     int f0_filter_radius = 3; /* --f0filter N: median filter on f0 (0 = off) */
     float rms_mix = 0.25f;    /* --rmsmix F: output follows input volume envelope (RVC default 0.25) */
+    float artifact_gate = 0.3f; /* --artgate F: artifact spectral gate strength (0=off, 0.3 typical) */
     float index_rate = 0.78f; /* --index-rate R: FAISS retrieval blend (RVC default 0.78) */
     float protect = 0.33f;    /* --protect P: voiceless-consonant protection (RVC default 0.33) */
     int harmony = 1;          /* --harmony 0/1: dual-fundamental detection + sine injection */
@@ -413,6 +414,9 @@ int main(int argc, char **argv) {
             rms_mix = (float)atof(argv[a + 1]);
             if (rms_mix < 0.0f) rms_mix = 0.0f;
             if (rms_mix > 1.0f) rms_mix = 1.0f;
+            a++;
+        } else if (strcmp(argv[a], "--artgate") == 0) {
+            artifact_gate = (float)atof(argv[a + 1]);
             a++;
         } else if (strcmp(argv[a], "--index-rate") == 0) {
             index_rate = (float)atof(argv[a + 1]);
@@ -1147,6 +1151,13 @@ int main(int argc, char **argv) {
 
     /* F0 contour smoothing — applied PRE-synth in the f0 path above
      * (--f0smooth). No post-synth hook needed. */
+
+    /* Artifact spectral gate (AF-Vocoder concept) — attenuate isolated
+     * flat-spectrum bursts the vocoder emits (digital clatter). */
+    if (artifact_gate > 0.001f) {
+        wubu_artifact_gate(out_audio, n_out, sr_out, artifact_gate);
+        printf("     [artgate] spectral artifact gate=%.2f applied\n", artifact_gate);
+    }
 
     /* RMS envelope mix — output follows the input's volume dynamics */
     if (rms_mix > 0.001f) {

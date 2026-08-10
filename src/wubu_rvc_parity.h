@@ -301,6 +301,15 @@ int wubu_rvc_synthesize_full(WuBuRVCModel *model,
                                 float *output,
                                 int max_samples);
 
+/* Blend content features with the FAISS retrieval (training-set neighbors).
+ * Only blends when the model has an index loaded; without one it copies the
+ * input unchanged. index_rate: 0 = no blend, 1 = full retrieval (RVC default
+ * 0.78). Returns 0 on success. */
+int wubu_rvc_retrieve_blend(const WuBuRVCModel *model,
+                            const float *content_feats, int n_frames,
+                            int content_dim, float index_rate,
+                            float *out);
+
 /* Clean up */
 void wubu_rvc_model_free(WuBuRVCModel *model);
 

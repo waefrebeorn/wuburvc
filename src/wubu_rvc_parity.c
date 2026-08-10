@@ -622,6 +622,60 @@ int wubu_faiss_search(const WuBuFaissIndex *idx,
 
 /* ── Full RVC synthesis pipeline ──
  * content → retrieval → flow posterior → generator → vocoder */
+int wubu_rvc_retrieve_blend(const WuBuRVCModel *model,
+                            const float *content_feats, int n_frames,
+                            int content_dim, float index_rate,
+                            float *out) {
+    if (!model || !content_feats || !out || n_frames < 1) return -1;
+    /* Top-k retrieval (if index loaded) — REAL FAISS search against the
+     * training-set vectors. No self-blend: if no index is loaded, retrieval
+     * is skipped entirely (ratio 0), never the query blended with itself. */
+    int k = 1; /* only the top-1 neighbor is used by the blend below */
+    int *retrieved_idx = (int *)calloc((size_t)k * n_frames, sizeof(int));
+    float *retrieved_dist = (float *)calloc((size_t)k * n_frames, sizeof(float));
+    int have_retrieval = 0;
+
+    if (model->n_index_vectors > 0 && model->retrieval_vectors) {
+        WuBuFaissIndex fake_idx;
+        fake_idx.d = model->index_dim > 0 ? model->index_dim : content_dim;
+        fake_idx.nb = model->n_index_vectors;
+        fake_idx.vectors = model->retrieval_vectors;
+        /* each frame's search is independent — parallel over frames (the
+         * brute-force scan is the dominant cost on long audio) */
+        int found = 0;
+#pragma omp parallel for schedule(static) if(n_frames >= 32) reduction(+:found)
+        for (int f = 0; f < n_frames; f++) {
+            if (wubu_faiss_search(&fake_idx, &content_feats[(size_t)f * content_dim],
+                                  fake_idx.d, k,
+                                  &retrieved_idx[(size_t)f * k],
+                                  &retrieved_dist[(size_t)f * k]) == 0)
+                found++;
+        }
+        have_retrieval = found > 0;
+    }
+
+    /* Blend content with retrieved (retrieval ratio = index_rate).
+     * Honest: only blend when the FAISS index actually returned real
+     * training-set neighbors. Without an index, ratio drops to 0. */
+    float retrieval_ratio = have_retrieval ? index_rate : 0.0f;
+    for (int f = 0; f < n_frames; f++) {
+        for (int d = 0; d < content_dim; d++) {
+            float orig = content_feats[(size_t)f * content_dim + d];
+            float retr = orig;
+            if (have_retrieval && retrieved_idx[(size_t)f * k] >= 0) {
+                int rid = retrieved_idx[(size_t)f * k];
+                if (rid >= 0 && rid < model->n_index_vectors)
+                    retr = model->retrieval_vectors[(size_t)rid * content_dim + d];
+            }
+            out[(size_t)f * content_dim + d] =
+                orig * (1.0f - retrieval_ratio) + retr * retrieval_ratio;
+        }
+    }
+    free(retrieved_idx);
+    free(retrieved_dist);
+    return 0;
+}
+
 int wubu_rvc_synthesize_full(WuBuRVCModel *model,
                                 const float *content_feats,
                                 const float *f0,

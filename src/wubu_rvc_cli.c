@@ -41,6 +41,7 @@
 #include <pthread.h>
 #include <omp.h>
 #include <immintrin.h>
+#include <dirent.h>
 #include "wubu_postproc.h"
 
 static void die(const char *msg) { fprintf(stderr, "wubu_rvc_cli: %s\n", msg); exit(1); }
@@ -163,6 +164,8 @@ typedef struct {
     int chunk_16k, extra_16k, hop_16k;
     int use_cuda;
     int use_vk;
+    float index_rate;   /* FAISS retrieval blend (0 = off, RVC default 0.78) */
+    float protect;      /* voiceless-consonant protection (RVC default 0.33) */
     float **audio; int *pos; int *len; int *rc;
     volatile int next; int n_chunks; int threads;
 } ChunkCtx;
@@ -186,15 +189,59 @@ static void *chunk_worker(void *arg) {
                                            (size_t)T_c * ctx->content_dim);
         if (got != T_c) { if (got < T_c) T_c = got; }
         if (T_c < 4) { free(content); ctx->rc[c] = 0; ctx->audio[c] = NULL; continue; }
+        /* ── RVC quality: FAISS retrieval blend (index_rate) ──
+         * The original pipeline blends content with the training-set
+         * neighbors BEFORE the ×2 upsample: feats = idx*rate + (1-rate)*feats.
+         * We keep a raw copy for protect (feats0) first, exactly like RVC's
+         * pipeline.py (feats0 = feats.clone() when protect < 0.5). */
+        float *feats0 = NULL;
+        if (ctx->protect < 0.5f) {
+            feats0 = (float *)malloc((size_t)T_c * ctx->content_dim * sizeof(float));
+            if (feats0)
+                memcpy(feats0, content, (size_t)T_c * ctx->content_dim * sizeof(float));
+        }
+        if (ctx->index_rate > 0.0f && ctx->model &&
+            ctx->model->n_index_vectors > 0 && ctx->model->retrieval_vectors) {
+            float *blended = (float *)malloc((size_t)T_c * ctx->content_dim * sizeof(float));
+            if (blended) {
+                wubu_rvc_retrieve_blend(ctx->model, content, T_c, ctx->content_dim,
+                                        ctx->index_rate, blended);
+                free(content);
+                content = blended;
+            }
+        }
         int T2_c = 0;
         float *cup = upsample_frames(content, T_c, ctx->content_dim, &T2_c);
         free(content);
-        if (!cup) { ctx->rc[c] = -1; continue; }
+        if (!cup) { if (feats0) free(feats0); ctx->rc[c] = -1; continue; }
         /* f0 slice for this chunk (100 fps: frame index = sample/160) */
         int f0_start = start / 160;
         int nf = T2_c;
         if (f0_start + nf > ctx->n_f0) nf = ctx->n_f0 - f0_start;
-        if (nf < 4) { free(cup); ctx->rc[c] = 0; ctx->audio[c] = NULL; continue; }
+        if (nf < 4) { free(cup); if (feats0) free(feats0); ctx->rc[c] = 0; ctx->audio[c] = NULL; continue; }
+        /* ── RVC quality: protect voiceless consonants (protect) ──
+         * After the ×2 upsample, RVC blends content back toward the RAW
+         * features (feats0) on unvoiced frames so "s/sh/f" and breaths keep
+         * the source's natural texture instead of the retrieved/modeled one:
+         *   pitchff[pitchf > 0] = 1; pitchff[pitchf < 1] = protect;
+         *   feats = feats*pitchff + feats0*(1-pitchff)
+         * protect=0.33 is the RVC default (0.5 = disable). */
+        if (feats0 && ctx->protect < 0.5f) {
+            int T0_2 = 0;
+            float *cup0 = upsample_frames(feats0, T_c, ctx->content_dim, &T0_2);
+            free(feats0);
+            if (cup0) {
+                int n0 = (T0_2 < nf) ? T0_2 : nf;
+                for (int j = 0; j < n0; j++) {
+                    float pf = (ctx->nsff0[f0_start + j] > 0.0f) ? 1.0f : ctx->protect;
+                    float *d = cup + (size_t)j * ctx->content_dim;
+                    const float *r = cup0 + (size_t)j * ctx->content_dim;
+                    for (int dd = 0; dd < ctx->content_dim; dd++)
+                        d[dd] = d[dd] * pf + r[dd] * (1.0f - pf);
+                }
+                free(cup0);
+            }
+        }
         /* transpose to col-major [dim, nf] */
         float *cmaj = (float *)malloc((size_t)ctx->content_dim * nf * sizeof(float));
         if (!cmaj) { free(cup); ctx->rc[c] = -1; continue; }
@@ -254,13 +301,15 @@ int main(int argc, char **argv) {
                 "         --noise S     : noise scale (0.0 = deterministic, 0.66666 = reference)\n"
                 "         --hubert PATH : override HuBERT weights path\n"
                 "         --preset N    : character preset (1=warm, 2=bright, 3=smooth, 4=breaty)\n"
+                "         --index-rate R: FAISS retrieval blend 0..1 (RVC default 0.78; auto-loads *.index)\n"
+                "         --protect P   : voiceless-consonant protection 0..0.5 (RVC default 0.33; 0.5=off)\n"
                 "         --snake       : use Snake activation (BigVGAN: x + (1/a)sin^2(a*x))\n"
                 "         --formant R   : formant shift ratio (1.0=none, <1=male, >1=female)\n"
                 "         --f0smooth S  : F0 contour smoothing strength (0.0-1.0)\n"
                 "         --f0ref DIR   : use reference f0 (nsff0_raw.bin + f0_coarse.bin)\n"
                 "         --chunk F     : chunked inference window in seconds (default 3.0)\n"
                 "         --ctx F       : HuBERT context window in seconds (default 0.72; 0.40 = speed mode)\n"
-                "         --mode M      : 'quality' (default, byte-identical reference) or 'speed'\n"
+                "         --mode M      : 'quality' (default, reference + protect/index/de-ess) or 'speed'\n"
                 "                        (real-time: ctx 0.4 + conv tile 2048, ~1 LSB diff)\n"
                 "         --xfade F     : crossfade overlap in seconds (default 0.10)\n"
                 "         --jobs N      : parallel chunk workers (default 4)\n",
@@ -284,6 +333,8 @@ int main(int argc, char **argv) {
     int force_yin = 0;        /* --f0 yin: force YIN instead of RMVPE */
     int f0_filter_radius = 3; /* --f0filter N: median filter on f0 (0 = off) */
     float rms_mix = 0.25f;    /* --rmsmix F: output follows input volume envelope (RVC default 0.25) */
+    float index_rate = 0.78f; /* --index-rate R: FAISS retrieval blend (RVC default 0.78) */
+    float protect = 0.33f;    /* --protect P: voiceless-consonant protection (RVC default 0.33) */
     int autokey_probe = 0;    /* --autokey N: auto key adaptation (N = probe secs) */
     float chunk_secs = 3.0f;  /* --chunk F: chunked inference (3s default; 0 = whole-track) */
     float ctx_secs = 0.72f;   /* --ctx F: HuBERT context window in seconds
@@ -340,6 +391,16 @@ int main(int argc, char **argv) {
             rms_mix = (float)atof(argv[a + 1]);
             if (rms_mix < 0.0f) rms_mix = 0.0f;
             if (rms_mix > 1.0f) rms_mix = 1.0f;
+            a++;
+        } else if (strcmp(argv[a], "--index-rate") == 0) {
+            index_rate = (float)atof(argv[a + 1]);
+            if (index_rate < 0.0f) index_rate = 0.0f;
+            if (index_rate > 1.0f) index_rate = 1.0f;
+            a++;
+        } else if (strcmp(argv[a], "--protect") == 0) {
+            protect = (float)atof(argv[a + 1]);
+            if (protect < 0.0f) protect = 0.0f;
+            if (protect > 0.5f) protect = 0.5f;   /* RVC caps at 0.5 */
             a++;
         } else if (strcmp(argv[a], "--autokey") == 0) {
             autokey_probe = atoi(argv[a + 1]);
@@ -408,31 +469,44 @@ int main(int argc, char **argv) {
     if (!chk) die("cannot open model.pth — pass --model");
     fclose(chk);
 
-    /* index: scan model_dir for any *.index file */
+    /* index: scan model_dir for any *.index file (RVC bundles the FAISS
+     * index next to the .pth — names vary: added_IVF*.index,
+     * trained_*.index, *_v2.index, etc.) */
     index_path[0] = 0;
     {
-        char idx_pat[1024];
-        snprintf(idx_pat, sizeof(idx_pat), "%s/*.index", model_dir);
-        /* Simple glob: check common index file patterns */
-        const char *idx_names[] = {
-            "added_IVF793_Flat_nprobe_1.index",
-            "trained_by_pool9045_Flat_nprobe_1.index",
-            NULL
-        };
-        for (int i = 0; idx_names[i] && !index_path[0]; i++) {
-            char test_path[1024];
-            snprintf(test_path, sizeof(test_path), "%s/%s", model_dir, idx_names[i]);
-            FILE *f = fopen(test_path, "rb");
-            if (f) { fclose(f); strncpy(index_path, test_path, sizeof(index_path)-1); }
+        DIR *dir = opendir(model_dir);
+        if (dir) {
+            struct dirent *de;
+            while ((de = readdir(dir)) != NULL) {
+                const char *nm = de->d_name;
+                size_t nl = strlen(nm);
+                if (nl > 6 && strcmp(nm + nl - 6, ".index") == 0) {
+                    snprintf(index_path, sizeof(index_path), "%s/%s", model_dir, nm);
+                    break;
+                }
+            }
+            closedir(dir);
         }
         if (!index_path[0]) {
-            /* Try the Cartman-specific name (backward compat) */
-            snprintf(index_path, sizeof(index_path),
-                     "%s/added_IVF793_Flat_nprobe_1_EricCartmanV1_v2.index", model_dir);
-            FILE *f = fopen(index_path, "rb");
-            if (!f) index_path[0] = 0;
-            else fclose(f);
+            /* Fallback: common names next to the explicit --model .pth */
+            char base[1024]; snprintf(base, sizeof(base), "%s", model_path);
+            char *slash = strrchr(base, '/');
+            if (!slash) slash = strrchr(base, '\\');
+            if (slash) *slash = 0;
+            const char *idx_names[] = {
+                "added_IVF793_Flat_nprobe_1.index",
+                "trained_by_pool9045_Flat_nprobe_1.index",
+                NULL
+            };
+            for (int i = 0; idx_names[i] && !index_path[0]; i++) {
+                char test_path[1024];
+                snprintf(test_path, sizeof(test_path), "%s/%s", base, idx_names[i]);
+                FILE *f = fopen(test_path, "rb");
+                if (f) { fclose(f); strncpy(index_path, test_path, sizeof(index_path)-1); }
+            }
         }
+        if (index_path[0])
+            printf("[0] index: %s\n", index_path);
     }
 
     /* 1. audio */
@@ -486,6 +560,8 @@ int main(int argc, char **argv) {
     int T = wubu_hubert_output_length(n16);
     int T2 = 0;
     float *content_up = NULL;
+    float *raw_up = NULL;   /* raw (pre-retrieval) content after ×2 — for protect */
+    int raw_up_n = 0;
     if (!use_chunk) {
         printf("[3] hubert frames: %d\n", T);
         float *content = (float *)malloc((size_t)T * content_dim * sizeof(float));
@@ -497,8 +573,37 @@ int main(int argc, char **argv) {
         if (Tc != T) { printf("     (hubert returned %d frames)\n", Tc); T = Tc; }
 
         /* 4. content ×2 upsample: [T, dim] -> [2T, dim] */
+        /* RVC quality: FAISS retrieval blend BEFORE the ×2 upsample.
+         * Keep the raw copy for protect (feats0) — the protect mask is
+         * applied after ×2 once nsff0 exists. */
+        float *feats0 = NULL;
+        if (protect < 0.5f) {
+            feats0 = (float *)malloc((size_t)T * content_dim * sizeof(float));
+            if (feats0)
+                memcpy(feats0, content, (size_t)T * content_dim * sizeof(float));
+        }
+        if (index_rate > 0.0f && rvc->model &&
+            rvc->model->n_index_vectors > 0 && rvc->model->retrieval_vectors) {
+            float *blended = (float *)malloc((size_t)T * content_dim * sizeof(float));
+            if (blended) {
+                wubu_rvc_retrieve_blend(rvc->model, content, T, content_dim,
+                                        index_rate, blended);
+                free(content);
+                content = blended;
+            }
+        }
         content_up = upsample_frames(content, T, content_dim, &T2);
         free(content);
+        if (feats0) {
+            int T0_2 = 0;
+            float *cup0 = upsample_frames(feats0, T, content_dim, &T0_2);
+            free(feats0);
+            /* stash the raw-upsampled content for the protect step below;
+             * reuse content_up pointer slot via a global temp is messy, so
+             * keep it in a local that the synth block can see. */
+            raw_up = cup0;
+            raw_up_n = T0_2;
+        }
         printf("[4] content_up frames: %d\n", T2);
     }
 
@@ -565,6 +670,15 @@ int main(int argc, char **argv) {
         if (f0_filter_radius > 0 && n_f0 > 0) {
             wubu_f0_median_filter(f0, n_f0, f0_filter_radius);
             printf("[5] f0 median filter radius %d applied\n", f0_filter_radius);
+        }
+        /* f0_smooth — additional contour smoothing BEFORE coarse binning
+         * (kills residual jitter after the median filter; keeps vibrato
+         * for strength <= 0.5). This is the hook that was previously a
+         * no-op — now applied pre-synth exactly where RVC's filter chain
+         * runs. */
+        if (f0_smooth > 0.0f && f0_smooth <= 1.0f && n_f0 > 0) {
+            wubu_f0_smooth(f0, n_f0, f0_smooth);
+            printf("[5] f0 contour smoothing strength %.2f applied\n", f0_smooth);
         }
         f0_coarse = (int *)malloc((size_t)(n_f0 + 2) * sizeof(int));
         nsff0 = (float *)malloc((size_t)(n_f0 + 2) * sizeof(float));
@@ -643,6 +757,8 @@ int main(int argc, char **argv) {
         ctx.noise_scale = noise_scale; ctx.use_snake = use_snake;
         ctx.use_cuda = use_cuda;
         ctx.use_vk = use_vk;
+        ctx.index_rate = index_rate;
+        ctx.protect = protect;
         ctx.ups_total = ups_total;
         ctx.chunk_16k = chunk_16k; ctx.extra_16k = extra_16k; ctx.hop_16k = hop_16k;
         ctx.audio = caudio; ctx.pos = cpos; ctx.len = clen; ctx.rc = crc;
@@ -707,6 +823,24 @@ int main(int argc, char **argv) {
         int max_audio = n_frames * ups_total;
         out_audio = (float *)malloc((size_t)max_audio * sizeof(float));
         if (!out_audio) die("alloc");
+
+        /* ── RVC quality: protect voiceless consonants (whole-track) ──
+         * Same mask as the chunk path: on unvoiced frames (nsff0 <= 0) blend
+         * content back toward the RAW (pre-retrieval) features so s/sh/f and
+         * breaths keep source texture instead of modeled/retrieved texture. */
+        if (protect < 0.5f && raw_up && raw_up_n > 0) {
+            int n0 = (raw_up_n < n_frames) ? raw_up_n : n_frames;
+            for (int j = 0; j < n0; j++) {
+                float pf = (nsff0[j] > 0.0f) ? 1.0f : protect;
+                float *d = content_up + (size_t)j * content_dim;
+                const float *r = raw_up + (size_t)j * content_dim;
+                for (int dd = 0; dd < content_dim; dd++)
+                    d[dd] = d[dd] * pf + r[dd] * (1.0f - pf);
+            }
+            printf("     [protect] voiceless-consonant blend=%.2f applied (%d frames)\n",
+                   protect, n0);
+        }
+        free(raw_up); raw_up = NULL;
 
     if (getenv("WUBU_RVC_DUMP")) {
         /* debug: dump the exact synth inputs for parity comparison */
@@ -796,6 +930,24 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* 6b. Default quality chain — de-ess when NO character preset was given.
+     * Research (WUBU_AUDIO_RESEARCH.md): de-ess BEFORE EQ so the EQ doesn't
+     * re-boost sibilance; RVC-class conversion can add 5-10kHz harshness on
+     * "s/sh/f" after protect blends. Gentle by default; presets override. */
+    if (preset == 0) {
+        WuBuPostProcOpts deopts;
+        memset(&deopts, 0, sizeof(deopts));
+        deopts.de_ess_strength = 0.12f;
+        deopts.de_ess_threshold = 0.05f;
+        float *pp = (float *)malloc((size_t)n_out * sizeof(float));
+        if (pp) {
+            wubu_post_process(out_audio, pp, n_out, sr_out, &deopts);
+            memcpy(out_audio, pp, (size_t)n_out * sizeof(float));
+            printf("     [de-ess] sibilance reduction applied (default quality chain)\n");
+            free(pp);
+        }
+    }
+
     /* Formant shift (gender conversion) */
     if (formant_shift > 0 && formant_shift != 1.0f) {
         float *fs = (float *)malloc((size_t)n_out * sizeof(float));
@@ -807,13 +959,8 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* F0 contour smoothing */
-    if (f0_smooth > 0.0f && f0_smooth <= 1.0f) {
-        /* Note: This would need to be applied before synthesis, not after.
-         * Currently logged as informational — for production, hook into the
-         * F0 extraction path before the synthesis step. */
-        printf("     [f0smooth] strength=%.2f (note: applies to F0 before synth)\n", f0_smooth);
-    }
+    /* F0 contour smoothing — applied PRE-synth in the f0 path above
+     * (--f0smooth). No post-synth hook needed. */
 
     /* RMS envelope mix — output follows the input's volume dynamics */
     if (rms_mix > 0.001f) {

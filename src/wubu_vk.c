@@ -1484,9 +1484,10 @@ int wubu_vk_generator_nsf(WuBuVk *vk, WuBuRVCModel *model,
                 hrad[j] = hf / (float)sr;
             }
         }
-        /* Step 2: carry / rad_acc (with jitter+shimmer, gated by inject_noise) */
-        float jit_amp = (inject_noise) ? 0.005f : 0.0f;   /* ±0.5% period */
-        float shim_amp = (inject_noise) ? 0.03f : 0.0f;   /* ±3% amplitude */
+        /* Step 2: carry / rad_acc (with jitter+shimmer, gated by inject_noise
+         * AND wubu_get_vibrato() so --vibrato 0 kills the added vibrato) */
+        float jit_amp = (inject_noise && wubu_get_vibrato()) ? 0.005f : 0.0f;   /* ±0.5% period */
+        float shim_amp = (inject_noise && wubu_get_vibrato()) ? 0.03f : 0.0f;   /* ±3% amplitude */
         float accum = 0.0f, haccum = 0.0f;
         for (int t = 0; t < nF; t++) {
             float jit = 0.0f, shim = 1.0f;
@@ -1745,29 +1746,21 @@ int wubu_vk_generator_nsf(WuBuVk *vk, WuBuRVCModel *model,
         rec_conv1d(vk, 3, pw_s, 10, 8, post_in, cur_n, 1, post_k, 1, post_pad, 1, out_n, 0, 2);
     }
 
-    vkEndCommandBuffer(vk->cb);
-    vk->no_flush = 0;   /* single-buffer mode ends here: submit once */
-    VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1,
-                        .pCommandBuffers = &vk->cb };
-    double t_rec = 0.0, t_sub = 0.0, t_dl = 0.0;
-    if (getenv("WUBU_TIME_STAGES")) {
-        double t0 = omp_get_wtime();
-        VkResult sr = vkQueueSubmit(vk->q, 1, &si, VK_NULL_HANDLE);
-        double t1 = omp_get_wtime();
-        VkResult wr = vkQueueWaitIdle(vk->q);
-        double t2 = omp_get_wtime();
-        fprintf(stderr, "[vkg-time] nF=%d submit_call=%.3fs wait=%.3fs sr=%d wr=%d\n",
-                nF, t1 - t0, t2 - t1, (int)sr, (int)wr);
-        int out_n = cur_n;
-        if (out_n > max_samples) out_n = max_samples;
-        double t3 = omp_get_wtime();
-        download(vk, 8, out_audio, (size_t)out_n * 4);
-        double t4 = omp_get_wtime();
-        fprintf(stderr, "[vkg-time] download=%.3fs TOTAL_incl_record=%.3fs\n", t4 - t3,
-                omp_get_wtime() - tg0);
-        return out_n;
+    int out_n = cur_n;
+    if (out_n > max_samples) out_n = max_samples;
+
+    /* In NO_FLUSH (single-buffer) mode: all dispatches were recorded into
+     * one command buffer with barriers between them. End + submit + wait.
+     * In PIPELINE mode: each dispatch was already submitted individually
+     * by rec_flush with its own fence. Just wait for the queue to drain,
+     * then download. Calling vkEndCommandBuffer on an already-rebegun cb
+     * (via rec_flush) would be a no-op/UB — skip it in pipeline mode. */
+    if (vk->no_flush) {
+        vkEndCommandBuffer(vk->cb);
+        VkSubmitInfo si = { .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                            .commandBufferCount = 1, .pCommandBuffers = &vk->cb };
+        vkQueueSubmit(vk->q, 1, &si, VK_NULL_HANDLE);
     }
-    vkQueueSubmit(vk->q, 1, &si, VK_NULL_HANDLE);
     vkQueueWaitIdle(vk->q);
     if (getenv("WUBU_TIME_STAGES"))
         fprintf(stderr, "[vkg-time] TOTAL generator incl record = %.3fs (nF=%d)\n",
@@ -1775,8 +1768,6 @@ int wubu_vk_generator_nsf(WuBuVk *vk, WuBuRVCModel *model,
     if (getenv("WUBU_VK_DBG"))
         fprintf(stderr, "VKDBG end generator nF=%d dspool_n=%u max_acc=%zu cur_ch=%d cur_n=%d\n",
                 nF, vk->dspool_n, max_acc, cur_ch, cur_n);
-    int out_n = cur_n;
-    if (out_n > max_samples) out_n = max_samples;
     download(vk, 8, out_audio, (size_t)out_n * 4);
     return out_n;
 }

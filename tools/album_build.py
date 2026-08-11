@@ -9,7 +9,7 @@ Pipeline (learned from the Ardour sessions):
   3. mix with the ARDOUR RECIPE: lead vocal +8.01 dB (the session's ACE
      Expander makeup), all other stems at unity, stereo pairs panned
   4. master to -18 dBFS RMS extended-LTS, -1 dBTP ceiling (the boss's
-     export spec: 'extended LTS -18db and apple class masters')
+     export spec: "extended LTS -18db and apple class masters")
 
 Character voices (the boss's rule):
   Track 4 (Seth's Lament)  = Seth MacFarlane's OWN voice (master as-is,
@@ -20,7 +20,7 @@ Character voices (the boss's rule):
                              Cleveland_Brown_220e_7920s.pth)
 
 Usage:
-  python tools/album_build.py <project_dir> <lead_pattern> <out_name> \
+  python tools/album_build.py <project_dir> <lead_pattern> <out_name> \\
       [--voice models/rvc/cleveland/Cleveland_Brown_220e_7920s.pth]
 """
 import argparse
@@ -89,6 +89,11 @@ def run(cmd):
     mingw = r"C:\msys64\mingw64\bin"
     if mingw not in env.get("PATH", ""):
         env["PATH"] = mingw + os.pathsep + env.get("PATH", "")
+    # Ensure the C11 subprocess can find Python for faiss IVF search
+    if "WUBU_PYTHON" not in env:
+        py = os.path.join(MEDIA, ".venv_win", "Scripts", "python.exe")
+        if os.path.isfile(py):
+            env["WUBU_PYTHON"] = py
     # stream output live (the boss watches album builds) and fail loudly
     r = subprocess.run(cmd, env=env)
     if r.returncode != 0:
@@ -111,7 +116,7 @@ VOCAL_GAIN = 2.512  # +8.01 dB (Ardour ACE Expander makeup on the vocal)
 OUT = os.path.join(MEDIA, "out", "album")
 
 
-def build(proj_dir, lead_pat, out_name, voice=VOICE):
+def build(proj_dir, lead_pat, out_name, voice=VOICE, harmony=1, vibrato=1, artgate=0.3, f0smooth=0.3, consonant=1):
     os.makedirs(OUT, exist_ok=True)
     stems_dir = os.path.join(proj_dir, "interchange",
                              os.path.basename(proj_dir), "audiofiles")
@@ -121,6 +126,8 @@ def build(proj_dir, lead_pat, out_name, voice=VOICE):
 
     # 1. slice all stems (full track)
     sliced = os.path.join(OUT, f"{out_name}_stems")
+    if os.path.exists(sliced):
+        shutil.rmtree(sliced)
     if not run([sys.executable, SLICE, stems_dir, sliced, "0", "99999"]):
         return 1
     stems = sorted(glob.glob(os.path.join(sliced, "*.wav")))
@@ -131,7 +138,9 @@ def build(proj_dir, lead_pat, out_name, voice=VOICE):
     # cleve2.wav / cleveland.wav over the dry stems; the boss's rule:
     # inputs are the dry interchange stems only). Match "vocals" but
     # EXCLUDE "backing" (Backing_Vocals sorts before Vocals) and any
-    # RVC artifacts (cleve2/cleve3/cleveland.wav, *_rvc*, *_ai*).
+    # RVC artifacts (cleve2/cleve3/cleveland.wav, *_rvc*, *_ai*, and
+    # take-variant "-2"/"-3" stems which are old RV outputs with wrong
+    # sample rates).
     import re as _re
     def _is_rvc_artifact(n):
         low = os.path.basename(n).lower()
@@ -139,6 +148,10 @@ def build(proj_dir, lead_pat, out_name, voice=VOICE):
         # OLD RVC conversions only (exact, anchored): cleve2/cleve3/cleve4/
         # cleve2-2/cleveland/cleveland-2. The DRY stems ("cleveland has hope
         # (Vocals)") must NEVER match — they are the real takes.
+        # Also exclude take-variant stems ("-2", "-3" suffixes): these are
+        # old RV outputs from previous renders with different sample rates.
+        if '-2' in base or '-3' in base or '-4' in base:
+            return True
         return (_re.fullmatch(r'cleve\d(-\d+)?', base) is not None
                 or _re.fullmatch(r'cleveland(-\d+)?', base) is not None
                 or 'rvc' in low or '_ai' in low or 'ai_' in low)
@@ -154,21 +167,27 @@ def build(proj_dir, lead_pat, out_name, voice=VOICE):
     if not lead:
         print("!! lead vocal stem not found in", stems[:5])
         return 1
+    # Prefer the original dry take: sort so base stems (without -N suffix)
+    # come first. If the first match has no suffix, keep it; otherwise pick
+    # the shortest-duration stem (the original dry take is the same duration
+    # across all variants, but the -2/-3 are old RV outputs we already
+    # filtered out above).
     lead = lead[0]
     print(f"[1] lead vocal (DRY): {os.path.basename(lead)}")
 
-    # 2. convert with the character model + full quality chain (Vulkan GPU gen)
-    #    jobs=4 + chunk 3: the VK ring-buffer deadlock that forced jobs=1 was
-    #    fixed — 4 workers now overlap CPU/GPU and a 240s track runs at
-    #    0.66x realtime (chunk 60 was 1.63x; small chunks amortize the GPU
-    #    pipeline better) with corr 1.00000000 vs the CPU path.
+    # 2. convert with the character model + full quality chain
+    #    --auto-index-rate auto-calibrates the FAISS retrieval blend based
+    #    on cosine similarity between query and neighbors, eliminating the
+    #    "Squidward" timbre distortion from garbage index vectors.
     vocal = os.path.join(OUT, f"{out_name}_vocal.wav")
     if not run([CLI, lead, os.path.dirname(voice), vocal,
                 "--model", voice, "--hubert", HUBERT,
-                "--vk", "--jobs", "4", "--chunk", "3",
+                "--jobs", "4", "--chunk", "3",
                 "--noise", "0.66666", "--autokey", "8",
-                "--f0smooth", "0.3", "--harmony", "1",
-                "--consonant", "1", "--breath", "1", "--artgate", "0.3"]):
+                "--f0smooth", str(float(f0smooth)), "--harmony", str(int(harmony)),
+                "--vibrato", str(int(vibrato)),
+                "--consonant", str(int(consonant)), "--breath", "1", "--artgate", str(float(artgate)),
+                "--auto-index-rate"]):
         return 1
     print(f"[2] converted ({os.path.basename(voice)}): {vocal}")
 
@@ -183,7 +202,7 @@ def build(proj_dir, lead_pat, out_name, voice=VOICE):
     if not run(cmd):
         return 1
     print(f"[3] mixed (vocal +{20 * math.log10(VOCAL_GAIN):.1f} dB): {out_name}_mix.wav")
-    
+
     # 4. MASTERING: normalize to -18 dBFS RMS extended-LTS (Ardour export spec)
     mix_path = os.path.join(OUT, f"{out_name}_mix.wav")
     master_path = os.path.join(OUT, f"{out_name}_mastered.wav")

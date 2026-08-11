@@ -49,24 +49,53 @@
 
 static void die(const char *msg) { fprintf(stderr, "wubu_rvc_cli: %s\n", msg); exit(1); }
 
-/* ── minimal WAV reader: mono PCM_16 or PCM_32 float ── */
+/* ── robust WAV reader: skips extra chunks (LIST/metadata/etc.) ──
+ * Parses the RIFF/WAVE chunk tree to find fmt + data by ID, not by
+ * assuming a flat 44-byte header. Handles ffmpeg-written WAVs that
+ * inject a LIST chunk (ISFT metadata) between fmt and data. */
 static float *read_wav(const char *path, int *n_out, int *sr_out) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
-    unsigned char hdr[44];
-    if (fread(hdr, 1, 44, f) != 44) { fclose(f); return NULL; }
+    unsigned char hdr[12];
+    if (fread(hdr, 1, 12, f) != 12) { fclose(f); return NULL; }
     if (memcmp(hdr, "RIFF", 4) != 0 || memcmp(hdr + 8, "WAVE", 4) != 0) { fclose(f); return NULL; }
-    unsigned short audiofmt = (unsigned short)(hdr[20] | hdr[21] << 8);
-    unsigned short nch = (unsigned short)(hdr[22] | hdr[23] << 8);
-    unsigned int sr = (unsigned int)(hdr[24] | hdr[25] << 8 | hdr[26] << 16 | hdr[27] << 24);
-    unsigned int databytes = (unsigned int)(hdr[40] | hdr[41] << 8 | hdr[42] << 16 | hdr[43] << 24);
-    unsigned short bits = (unsigned short)(hdr[34] | hdr[35] << 8);
-    fseek(f, 44, SEEK_SET);
+    unsigned short audiofmt = 1, nch = 1, bits = 16;
+    unsigned int sr = 0, databytes = 0;
+    int data_pos = -1;
+    /* walk top-level chunks */
+    for (;;) {
+        unsigned char cid[4];
+        unsigned char szb[4];
+        if (fread(cid, 1, 4, f) != 4) { fclose(f); return NULL; }
+        if (fread(szb, 1, 4, f) != 4) { fclose(f); return NULL; }
+        unsigned int csize = (unsigned int)(szb[0] | szb[1] << 8 | szb[2] << 16 | szb[3] << 24);
+        long here = ftell(f);
+        if (memcmp(cid, "fmt ", 4) == 0) {
+            unsigned char fhdr[16];
+            int toread = (csize < 16) ? (int)csize : 16;
+            if (fread(fhdr, 1, (size_t)toread, f) != (size_t)toread) { fclose(f); return NULL; }
+            audiofmt = (unsigned short)(fhdr[0] | fhdr[1] << 8);
+            nch = (unsigned short)(fhdr[2] | fhdr[3] << 8);
+            sr = (unsigned int)(fhdr[4] | fhdr[5] << 8 | fhdr[6] << 16 | fhdr[7] << 24);
+            bits = (unsigned short)(fhdr[14] | fhdr[15] << 8);
+            fseek(f, here + (long)csize, SEEK_SET);
+        } else if (memcmp(cid, "data", 4) == 0) {
+            databytes = csize;
+            data_pos = (int)ftell(f);
+            break;
+        } else {
+            /* skip unknown chunk (LIST, ISFT, fact, etc.) */
+            fseek(f, here + (long)csize, SEEK_SET);
+        }
+    }
+    if (data_pos < 0 || databytes == 0) { fclose(f); return NULL; }
+    fseek(f, data_pos, SEEK_SET);
     unsigned char *raw = (unsigned char *)malloc(databytes ? databytes : 1);
     if (!raw) { fclose(f); return NULL; }
     if (fread(raw, 1, databytes, f) != databytes) { free(raw); fclose(f); return NULL; }
     fclose(f);
-    int nsamples = databytes / (bits / 8) / nch;
+    int nsamples = (int)(databytes / (bits / 8) / nch);
+    if (nsamples <= 0) { free(raw); return NULL; }
     float *out = (float *)malloc((size_t)nsamples * sizeof(float));
     if (!out) { free(raw); return NULL; }
     for (int i = 0; i < nsamples; i++) {
@@ -171,6 +200,7 @@ typedef struct {
     int use_cuda;
     int use_vk;
     float index_rate;   /* FAISS retrieval blend (0 = off, RVC default 0.78) */
+    int   auto_index_rate; /* 1 = auto-detect index_rate via cosine similarity */
     float protect;      /* voiceless-consonant protection (RVC default 0.33) */
     float **audio; int *pos; int *len; int *rc;
     volatile int next; int n_chunks; int threads;
@@ -206,8 +236,9 @@ static void *chunk_worker(void *arg) {
             if (feats0)
                 memcpy(feats0, content, (size_t)T_c * ctx->content_dim * sizeof(float));
         }
-        if (ctx->index_rate > 0.0f && ctx->model &&
-            ctx->model->n_index_vectors > 0 && ctx->model->retrieval_vectors) {
+        if ((ctx->index_rate > 0.0f || ctx->auto_index_rate) && ctx->model &&
+            ctx->model->n_index_vectors > 0 &&
+            (ctx->model->retrieval_vectors || ctx->model->faiss_idx)) {
             float *blended = (float *)malloc((size_t)T_c * ctx->content_dim * sizeof(float));
             if (blended) {
                 wubu_rvc_retrieve_blend(ctx->model, content, T_c, ctx->content_dim,
@@ -328,10 +359,13 @@ int main(int argc, char **argv) {
                 "         --hubert PATH : override HuBERT weights path\n"
                 "         --preset N    : character preset (1=warm, 2=bright, 3=smooth, 4=breaty)\n"
                 "         --index-rate R: FAISS retrieval blend 0..1 (RVC default 0.78; auto-loads *.index)\n"
+                "         --auto-index-rate: auto-detect optimal index blend via cosine similarity\n"
                 "         --protect P   : voiceless-consonant protection 0..0.5 (RVC default 0.33; 0.5=off)\n"
                 "         --snake       : use Snake activation (BigVGAN: x + (1/a)sin^2(a*x))\n"
                 "         --formant R   : formant shift ratio (1.0=none, <1=male, >1=female)\n"
                 "         --f0smooth S  : F0 contour smoothing strength (0.0-1.0)\n"
+                "         --harmony 0/1 : harmony detection + sine injection (default 1)\n"
+                "         --vibrato 0/1 : jitter/shimmer added-vibrato injection (default 1; 0 = raw timbre)\n"
                 "         --f0ref DIR   : use reference f0 (nsff0_raw.bin + f0_coarse.bin)\n"
                 "         --chunk F     : chunked inference window in seconds (default 3.0)\n"
                 "         --ctx F       : HuBERT context window in seconds (default 0.72; 0.40 = speed mode)\n"
@@ -346,6 +380,15 @@ int main(int argc, char **argv) {
     const char *model_dir = argv[2];
     const char *out_path = argv[3];
     srand((unsigned)time(NULL));  /* seed for NSF noise injection */
+    /* WUBU_MODELS overrides the default models/rvc base path — lets voice
+     * models + shared weights (hubert/rmvpe) live on the D: drive without
+     * copying 1+ GB of shared weights per rebuild. */
+    const char *models_root = getenv("WUBU_MODELS");
+    char default_models[1024];
+    if (!models_root) {
+        snprintf(default_models, sizeof(default_models), "models/rvc");
+        models_root = default_models;
+    }
     char model_path[1024] = {0};
     char index_path[1024] = {0};
     char hubert_path[1024] = {0};
@@ -363,6 +406,7 @@ int main(int argc, char **argv) {
     float rms_mix = 0.25f;    /* --rmsmix F: output follows input volume envelope (RVC default 0.25) */
     float artifact_gate = 0.3f; /* --artgate F: artifact spectral gate strength (0=off, 0.3 typical) */
     float index_rate = 0.78f; /* --index-rate R: FAISS retrieval blend (RVC default 0.78) */
+    int auto_index_rate = 0;  /* --auto-index-rate: auto-detect blend from index quality */
     float protect = 0.33f;    /* --protect P: voiceless-consonant protection (RVC default 0.33) */
     int harmony = 1;          /* --harmony 0/1: dual-fundamental detection + sine injection */
     int consonant_uv = 1;     /* --consonant 0/1: spectral-flatness uv mask (noise excitation on unvoiced) */
@@ -432,6 +476,10 @@ int main(int argc, char **argv) {
             index_rate = (float)atof(argv[a + 1]);
             if (index_rate < 0.0f) index_rate = 0.0f;
             if (index_rate > 1.0f) index_rate = 1.0f;
+            auto_index_rate = 0;  /* explicit override disables auto-detection */
+            a++;
+        } else if (strcmp(argv[a], "--auto-index-rate") == 0) {
+            auto_index_rate = 1;
             a++;
         } else if (strcmp(argv[a], "--protect") == 0) {
             protect = (float)atof(argv[a + 1]);
@@ -440,6 +488,9 @@ int main(int argc, char **argv) {
             a++;
         } else if (strcmp(argv[a], "--harmony") == 0) {
             harmony = atoi(argv[a + 1]);
+            a++;
+        } else if (strcmp(argv[a], "--vibrato") == 0) {
+            wubu_set_vibrato(atoi(argv[a + 1]));
             a++;
         } else if (strcmp(argv[a], "--consonant") == 0) {
             consonant_uv = atoi(argv[a + 1]);
@@ -595,14 +646,21 @@ int main(int argc, char **argv) {
     /* 3. HuBERT content (v2: layer 12 768-dim, v1: layer 9 + final_proj 256-dim) */
     WuBuHubert hb;
     memset(&hb, 0, sizeof(hb));
-    /* Allow --hubert PATH override; otherwise search model_dir then default */
-    const char *hubert_bin = hubert_path[0] ? hubert_path : "models/rvc/hubert_weights.bin";
-    if (!hubert_path[0]) {
+    /* Allow --hubert PATH override; otherwise search WUBU_MODELS dir then
+     * model_dir, then fall back to the default models/rvc path. */
+    const char *hubert_bin = hubert_path[0] ? hubert_path : NULL;
+    if (!hubert_bin) {
         char hp[1024];
-        snprintf(hp, sizeof(hp), "%s/hubert_weights.bin", model_dir);
+        snprintf(hp, sizeof(hp), "%s/hubert_weights.bin", models_root);
         FILE *hf = fopen(hp, "rb");
         if (hf) { fclose(hf); hubert_bin = hp; }
+        else {
+            snprintf(hp, sizeof(hp), "%s/hubert_weights.bin", model_dir);
+            hf = fopen(hp, "rb");
+            if (hf) { fclose(hf); hubert_bin = hp; }
+        }
     }
+    if (!hubert_bin) hubert_bin = "models/rvc/hubert_weights.bin";
     if (wubu_hubert_load(&hb, hubert_bin) != 0)
         die("hubbert weights missing — run tools/extract_hubert_weights.py or pass --hubert PATH");
     int T = wubu_hubert_output_length(n16);
@@ -668,6 +726,16 @@ int main(int argc, char **argv) {
     int *f0_coarse = NULL;
     float *nsff0 = NULL;
     int n_f0_2 = 0;
+    /* Resolve rmvpe_weights.bin via WUBU_MODELS, model_dir, then default */
+    char rmvpe_path[1024] = {0};
+    { char tp[1024];
+      snprintf(tp, sizeof(tp), "%s/rmvpe_weights.bin", models_root);
+      FILE *tf = fopen(tp, "rb");
+      if (tf) { fclose(tf); snprintf(rmvpe_path, sizeof(rmvpe_path), "%s", tp); }
+      else { snprintf(tp, sizeof(tp), "%s/rmvpe_weights.bin", model_dir);
+             tf = fopen(tp, "rb");
+             if (tf) { fclose(tf); snprintf(rmvpe_path, sizeof(rmvpe_path), "%s", tp); } } }
+    if (!rmvpe_path[0]) snprintf(rmvpe_path, sizeof(rmvpe_path), "models/rvc/rmvpe_weights.bin");
     if (f0ref_dir[0]) {
         char fp[1024], cp[1024];
         snprintf(fp, sizeof(fp), "%s/nsff0_raw.bin", f0ref_dir);
@@ -701,7 +769,7 @@ int main(int argc, char **argv) {
          * are missing or --f0 yin was passed. */
         WuBuRmvpe *rm = NULL;
         if (!force_yin) {
-            rm = wubu_rmvpe_load("models/rvc/rmvpe_weights.bin");
+            rm = wubu_rmvpe_load(rmvpe_path);
             if (rm) {
                 n_f0 = wubu_rmvpe_f0(rm, pcm16, n16, f0, n16 / 160 + 8);
                 printf("[5] rmvpe f0 frames: %d\n", n_f0);
@@ -808,7 +876,7 @@ int main(int argc, char **argv) {
             printf("[5b] autokey cached shift %+.1f st (input mean %.0f Hz)\n",
                    autokey_shift, in_mean);
         } else {
-            WuBuRmvpe *rm2 = wubu_rmvpe_load("models/rvc/rmvpe_weights.bin");
+            WuBuRmvpe *rm2 = wubu_rmvpe_load(rmvpe_path);
             if (rm2) {
                 float drift = 0;
                 autokey_shift = wubu_autokey_calibrate(
@@ -956,6 +1024,7 @@ int main(int argc, char **argv) {
         ctx.use_cuda = use_cuda;
         ctx.use_vk = use_vk;
         ctx.index_rate = index_rate;
+        ctx.auto_index_rate = auto_index_rate;
         ctx.protect = protect;
         ctx.ups_total = ups_total;
         ctx.chunk_16k = chunk_16k; ctx.extra_16k = extra_16k; ctx.hop_16k = hop_16k;
@@ -1195,6 +1264,31 @@ int main(int argc, char **argv) {
             memcpy(out_audio, restored, (size_t)n_out * sizeof(float));
             printf("     [autokey] restored output by %+.1f st\n", -autokey_shift);
             free(restored);
+        }
+    }
+
+    /* Final RMS normalization — ensures consistent output level across
+     * all voices. Different models (Cleveland 32k, SpongeBob 48k, etc.)
+     * produce wildly different raw generator RMS. Normalize to 0.10
+     * (≈ -20 dBFS, speech reference level), then peak-limit to 0.99
+     * to prevent clipping. This runs AFTER rms_mix so the input's
+     * dynamics are preserved but the overall level is consistent. */
+    {
+        float sum_sq = 0.0f, peak = 0.0f;
+        for (int i = 0; i < n_out; i++) {
+            float a = out_audio[i];
+            sum_sq += a * a;
+            float pa = fabsf(a);
+            if (pa > peak) peak = pa;
+        }
+        float rms = sqrtf(sum_sq / (float)n_out);
+        if (rms > 1e-9f) {
+            float target_rms = 0.10f;
+            float scale = target_rms / rms;
+            if (peak * scale > 0.99f) scale = 0.99f / peak;
+            for (int i = 0; i < n_out; i++) out_audio[i] *= scale;
+            printf("     [rmsnorm] %.4f -> %.4f (peak %.3f)\n",
+                   rms, rms * scale, peak * scale);
         }
     }
 

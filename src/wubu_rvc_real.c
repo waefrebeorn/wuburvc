@@ -119,6 +119,15 @@ int wubu_get_conv_tile(void) { return g_conv_tile; }
 /* Fast-math switch lives in wubu_math.c (shared with GRU/HuBERT/RMVPE):
  * wubu_get_fast_math() — 0 = libm (byte-identical), 1 = folded-poly (speed). */
 
+/* Vibrato/jitter injection switch (--vibrato 0/1, default ON):
+ * gates the per-frame jitter (±0.5% period) + shimmer (±3% amplitude) that
+ * the generator ADDS on voiced frames. Turning it off keeps the RVC
+ * reference posterior noise (--noise 0.66666) but stops the added
+ * cycle-to-cycle vibrato — for when the boss wants the raw model timbre. */
+static int g_wubu_vibrato = 1;
+void wubu_set_vibrato(int on) { g_wubu_vibrato = on ? 1 : 0; }
+int wubu_get_vibrato(void) { return g_wubu_vibrato; }
+
 void conv1d_c(const float *in, int in_ch, int n,
               const float *w, const float *b,
               int out_ch, int k, int stride, int pad, int dil,
@@ -1457,8 +1466,8 @@ int wubu_generator_nsf(WuBuRVCModel *model,
          * held vowels. Add a small per-frame period modulation (±0.15%
          * voiced, gated by inject_noise so --noise 0 stays bit-exact) and
          * per-frame amplitude shimmer (±2%) via the phase accumulator. */
-        float jit_amp = (inject_noise) ? 0.005f : 0.0f;   /* ±0.5% period (natural jitter range 0.5–1.5%) */
-        float shim_amp = (inject_noise) ? 0.03f : 0.0f;   /* ±3% amplitude (natural shimmer 2–8%) */
+        float jit_amp = (inject_noise && wubu_get_vibrato()) ? 0.005f : 0.0f;   /* ±0.5% period (natural jitter range 0.5–1.5%) */
+        float shim_amp = (inject_noise && wubu_get_vibrato()) ? 0.03f : 0.0f;   /* ±3% amplitude (natural shimmer 2–8%) */
         for (int t = 0; t < nF; t++) {
             float jit = 0.0f, shim = 1.0f;
             if (jit_amp > 0.0f && nsff0[t] > 40.0f) {

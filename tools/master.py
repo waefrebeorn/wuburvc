@@ -7,10 +7,11 @@ Usage:
 """
 import subprocess
 import sys
+import os
 
 
 def normalize_to_rms(input_path, output_path, target_rms_db, ceiling_db):
-    # loudnorm I = integrated loudness target in LUFS (negative), TP = true peak
+    """Loudnorm to target integrated loudness (LUFS, negative dB) with true-peak ceiling."""
     cmd = [
         'ffmpeg', '-y', '-i', input_path,
         '-af', f'loudnorm=I={target_rms_db}:TP={ceiling_db}:LRA=11',
@@ -20,8 +21,8 @@ def normalize_to_rms(input_path, output_path, target_rms_db, ceiling_db):
     if result.returncode == 0:
         print(f"Mastered: {output_path} to {target_rms_db}dB RMS")
         return True
-    print("Mastering failed:")
-    print(result.stderr)
+    print(f"Mastering failed for {os.path.basename(input_path)}")
+    print(result.stderr[-500:])
     return False
 
 

@@ -378,6 +378,14 @@ void wubu_rms_mix_rate(const float *input, float *output, int n, int sr,
     float *env_in = (float *)malloc((size_t)n_frames * sizeof(float));
     float *env_out = (float *)malloc((size_t)n_frames * sizeof(float));
     if (!env_in || !env_out) { free(env_in); free(env_out); return; }
+    /* Robust envelope: use a floored RMS so silent frames do NOT divide to
+     * near-infinity. The floor is relative to the frame's own magnitude —
+     * an absolute epsilon (1e-9) still blows up a -80dB frame by 1e7x. */
+    double max_in = 1e-9, max_out = 1e-9;
+    for (int i = 0; i < n; i++) {
+        double ai = fabs((double)input[i]); if (ai > max_in) max_in = ai;
+        double ao = fabs((double)output[i]); if (ao > max_out) max_out = ao;
+    }
     for (int f = 0; f < n_frames; f++) {
         double si = 0, so = 0;
         for (int j = 0; j < win; j++) {
@@ -385,10 +393,23 @@ void wubu_rms_mix_rate(const float *input, float *output, int n, int sr,
             si += (double)input[idx] * input[idx];
             so += (double)output[idx] * output[idx];
         }
-        env_in[f] = (float)sqrt(si / win);
-        env_out[f] = (float)sqrt(so / win);
+        float ri = (float)sqrt(si / win);
+        float ro = (float)sqrt(so / win);
+        /* floor at -60dB relative to the track's peak level (or absolute
+         * 1e-4 if the track is that quiet) — silent frames stay silent,
+         * they never divide to a 1000x+ gain. */
+        float floor_in = (float)max_in * 1e-3f;
+        float floor_out = (float)max_out * 1e-3f;
+        if (floor_in < 1e-4f) floor_in = 1e-4f;
+        if (floor_out < 1e-4f) floor_out = 1e-4f;
+        env_in[f] = (ri < floor_in) ? floor_in : ri;
+        env_out[f] = (ro < floor_out) ? floor_out : ro;
     }
-    /* apply blended envelope, linear-interp between frames */
+    /* apply blended envelope, linear-interp between frames.
+     * gain = target_env / out_env, but CAP the gain so a quiet frame can
+     * never multiply the audio by a huge factor (max +12dB, min -40dB). */
+    const float gmax = 3.9810717f;   /* +12 dB */
+    const float gmin = 0.01f;        /* -40 dB */
     for (int i = 0; i < n; i++) {
         double pos = (double)i / hop;
         int f0 = (int)pos;
@@ -397,7 +418,10 @@ void wubu_rms_mix_rate(const float *input, float *output, int n, int sr,
         float ei = (float)(env_in[f0] + (env_in[f0 + 1] - env_in[f0]) * frac);
         float eo = (float)(env_out[f0] + (env_out[f0 + 1] - env_out[f0]) * frac);
         float env = ei * mix + eo * (1.0f - mix);
-        if (eo > 1e-9f) output[i] *= env / eo;
+        float g = env / eo;
+        if (g > gmax) g = gmax;
+        if (g < gmin) g = gmin;
+        output[i] *= g;
     }
     free(env_in);
     free(env_out);

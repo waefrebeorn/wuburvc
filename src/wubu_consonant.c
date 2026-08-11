@@ -90,8 +90,21 @@ int wubu_consonant_uv(const float *pcm, int n_samples, int sr,
             for (int h = 1; h <= 8; h++) {
                 int b = (int)(f0_bin * h + 0.5f);
                 if (b < 1 || b >= nbins) break;
-                float m = sqrtf(spec[b].re * spec[b].re + spec[b].im * spec[b].im);
-                harm_e += (double)m * m;
+                /* HNR WINDOW FIX (2026-08-10): a single FFT bin per harmonic
+                 * UNDERESTIMATES harmonic energy — a Hann window spreads each
+                 * harmonic over ~±1 bin (main-lobe width ~4 bins at this
+                 * nfft), so summing only the center bin dropped HNR below the
+                 * 0.5 voiced threshold on ~37% of genuinely voiced frames
+                 * (measured on the track-3 dry vocal: 105/282 sampled frames
+                 * flipped). The mask then gated the sine OFF on vowels →
+                 * breathy/buzzy "post process off" sound. Sum ±1 bin around
+                 * each harmonic (the same window the peak detector sees). */
+                for (int wb = b - 1; wb <= b + 1; wb++) {
+                    if (wb < 1 || wb >= nbins) continue;
+                    float mw = sqrtf(spec[wb].re * spec[wb].re +
+                                     spec[wb].im * spec[wb].im);
+                    harm_e += (double)mw * mw;
+                }
             }
             hnr = (float)(harm_e / tot_e);   /* 0..~1 (1 = pure harmonic) */
         }

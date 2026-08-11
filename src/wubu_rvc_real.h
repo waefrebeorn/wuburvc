@@ -45,6 +45,8 @@ int wubu_get_conv_tile(void);
  * Defined in wubu_math.h (shared), set by the CLI in --mode speed. */
 void wubu_set_fast_math(int on);
 int wubu_get_fast_math(void);
+void wubu_set_vibrato(int on);
+int wubu_get_vibrato(void);
 
 /* ── Real RVC synthesis (the whole acoustic model) ──
  * model: loaded WuBuRVCModel (tensor map must contain enc_p.*, flow.*,

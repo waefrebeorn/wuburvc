@@ -41,7 +41,7 @@ RVC_SRCS="src/wubu_rvc.c src/wubu_rvc_parity.c src/wubu_rvc_weights.c \
           src/wubu_stft.c src/wubu_gru.c src/wubu_audioio.c \
           src/wubu_pitch.c src/wubu_autokey.c src/wubu_fft.c src/wubu_math.c src/wubu_vk.c \
           src/wubu_harmony.c src/wubu_consonant.c src/wubu_breath.c \
-          src/wubu_train.c src/wubu_train_vk.c"
+          src/wubu_train.c src/wubu_train_vk.c src/wubu_ivf.c"
 
 log() { printf '\033[1;36m[build]\033[0m %s\n' "$*"; }
 

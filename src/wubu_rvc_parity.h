@@ -17,6 +17,7 @@
  */
 
 #include "wubu_rvc.h"
+#include "wubu_ivf.h"
 
 /* Forward declare — full struct defined in wubu_rvc_parity.c via wubu_rvc.c */
 struct WuBuRVCModel;
@@ -193,6 +194,8 @@ struct WuBuRVCModel {
     int    index_dim;
     float *retrieval_vectors;   /* [n_index * dim] */
     int    n_retrieval;         /* top-k retrieval */
+    char   index_path[512];     /* on-disk path of the loaded .index */
+    struct WuBuFaissIndex *faiss_idx;  /* owned; NULL if none loaded */
 
     /* Tensor map (loaded from .pth / .bin) */
     RVCTensor *tensors;
@@ -350,13 +353,19 @@ void wubu_rvc_model_info(const WuBuRVCModel *model, RVCModelInfo *out);
 
 /* FAISS index parsing — parse binary .index file
  * (IVF + Flat L2 format used by Mangio-RVC-Fork) */
-typedef struct {
+typedef struct WuBuFaissIndex {
     int    d;           /* dimension */
     int    nb;          /* number of vectors */
     float *centroids;   /* [nlist * d] */
     int    nlist;
     int    nprobe;
-    float *vectors;     /* [nb * d] */
+    float *vectors;     /* [nb * d] — for flat/WUBU format only */
+    /* IVF (native C11) path — owned when non-NULL. Replaces the old
+     * Python subprocess path: we parse the FAISS IndexIVFFlat binary
+     * format ourselves in wubu_ivf.c and search without spawning Python. */
+    WuBuIVF *native_ivf;
+    char   index_path[512]; /* original on-disk path (for error reporting) */
+    int    needs_subprocess; /* 0 = native IVF or in-memory flat; 1 = legacy */
 } WuBuFaissIndex;
 
 WuBuFaissIndex *wubu_faiss_load(const char *path);

@@ -509,9 +509,9 @@ WuBuFaissIndex *wubu_faiss_load(const char *path) {
 
     /* FAISS serialized format: magic "IwFl" (0x4977466c) for IVF indexes */
     if (memcmp(magic, "IwFl", 4) == 0) {
-        /* Real FAISS IndexIVFFlat — defer search to Python faiss helper.
-         * Read d and nb from the header for validation, but don't try to
-         * parse the complex IVF binary structure in C11. */
+        /* Native C11 IndexIVFFlat — parse + search without Python.
+         * Read d and nb from the header for validation, then let
+         * wubu_ivf_load do the real binary parse. */
         int32_t d;
         if (fread(&d, 4, 1, f) != 1) goto fail;
         int64_t nb64;
@@ -522,13 +522,18 @@ WuBuFaissIndex *wubu_faiss_load(const char *path) {
             if (fread(&nb32, 4, 1, f) != 1) goto fail;
             nb64 = nb32;
         }
+        fclose(f);
+
+        WuBuIVF *ivf = wubu_ivf_load(path);
+        if (!ivf) { free(idx); return NULL; }
+
+        strncpy(idx->index_path, path, sizeof(idx->index_path) - 1);
         idx->d = d;
         idx->nb = (int)nb64;
-        idx->nlist = 1;           /* unknown for IVF — handled by Python */
-        idx->needs_subprocess = 1; /* use Python faiss helper for search */
-        /* Save the on-disk path for the subprocess */
-        strncpy(idx->index_path, path, sizeof(idx->index_path) - 1);
-        fclose(f);
+        idx->nlist = (int)wubu_ivf_nlist(ivf);
+        idx->nprobe = wubu_ivf_get_nprobe(ivf);
+        idx->native_ivf = ivf;       /* native search path */
+        idx->needs_subprocess = 0;   /* no Python */
         return idx;
     }
 
@@ -571,6 +576,10 @@ fail:
 
 void wubu_faiss_free(WuBuFaissIndex *idx) {
     if (!idx) return;
+    if (idx->native_ivf) {
+        wubu_ivf_free(idx->native_ivf);
+        idx->native_ivf = NULL;
+    }
     free(idx->centroids);
     free(idx->vectors);
     free(idx);
@@ -632,153 +641,6 @@ int wubu_faiss_search(const WuBuFaissIndex *idx,
     return 0;
 }
 
-/* ── IVF FAISS subprocess search ──
- * Calls Python+faiss (wubu_faiss_search.py) to search a real FAISS
- * IndexIVFFlat. The C11 cannot parse FAISS's serialized C++ format,
- * so the real faiss library does the search and returns neighbor
- * vectors + distances as raw float32 bytes.
- *
- * Returns 0 on success, -1 on failure. */
-static int wubu_faiss_search_subprocess(const WuBuFaissIndex *idx,
-                                        const float *content_feats,
-                                        int n_frames, int content_dim, int k,
-                                        float *out_auto_rate,
-                                        float *out_vectors,
-                                        float *out_distances) {
-    if (!idx || !idx->index_path[0] || !content_feats || !out_vectors)
-        return -1;
-
-    /* Locate the Python helper script (wubu_faiss_search.py). */
-    char helper_path[2048];
-
-    /* Try relative to the executable's directory */
-    const char *exe_hint = getenv("WUBU_RVC_PYHELP");
-    if (exe_hint && exe_hint[0]) {
-        snprintf(helper_path, sizeof(helper_path), "%s", exe_hint);
-    } else {
-        /* Try several candidate paths for the helper script */
-        const char *candidates[] = {
-            "C:/Users/eman5/wuburvc/src/wubu_faiss_search.py",
-            "../wuburvc/src/wubu_faiss_search.py",
-            "src/wubu_faiss_search.py",
-            "/c/Users/eman5/wuburvc/src/wubu_faiss_search.py",
-            NULL
-        };
-        helper_path[0] = 0;
-        for (int i = 0; candidates[i]; i++) {
-            FILE *tf = fopen(candidates[i], "rb");
-            if (tf) { fclose(tf);
-                strncpy(helper_path, candidates[i], sizeof(helper_path) - 1);
-                break;
-            }
-        }
-        if (!helper_path[0]) {
-            strncpy(helper_path, "wubu_faiss_search.py", sizeof(helper_path) - 1);
-        }
-    }
-
-    /* Build the command: python wubu_faiss_search.py <index> <k> <nf> <dim> */
-    const char *py = getenv("WUBU_PYTHON");
-    if (!py) py = "python";
-
-    fprintf(stderr, "[faiss-dbg] helper=%s py=%s index=%s k=%d nf=%d dim=%d\n",
-            helper_path, py, idx->index_path, k, n_frames, content_dim);
-
-    /* ── Windows popen cannot do bidirectional "w+b" ──────────────────────
-     * MSVCRT _popen only supports "r"/"w"/"rb"/"wb" (verified: "w+b"
-     * returns NULL). The old code wrote queries then read the answer over
-     * one pipe, which NEVER WORKED on Windows: the subprocess was never
-     * spawned, retrieval was silently disabled (ratio 0) — "works better
-     * without the index than with it" because with == without.
-     * Fix: write queries to a temp file, redirect the helper's stdout to a
-     * result file, run via system() (the canonical cmd.exe /c pattern for
-     * multiple quoted args — see system-bridge-rc1-fix), then read the
-     * result file back. Temp names are unique per call so the jobs=4 chunk
-     * workers don't clobber each other. */
-    static int g_faiss_seq = 0;
-    int seq = __sync_fetch_and_add(&g_faiss_seq, 1);
-    char qfile[1024], rfile[1024];
-    const char *tmp = getenv("TEMP");
-    if (!tmp || !tmp[0]) tmp = ".";
-    snprintf(qfile, sizeof(qfile), "%s/faiss_q_%d.bin", tmp, seq);
-    snprintf(rfile, sizeof(rfile), "%s/faiss_r_%d.bin", tmp, seq);
-
-    size_t total_floats = (size_t)n_frames * content_dim;
-    FILE *qf = fopen(qfile, "wb");
-    if (!qf) {
-        fprintf(stderr, "[faiss-dbg] cannot create %s\n", qfile);
-        return -1;
-    }
-    if (fwrite(content_feats, sizeof(float), total_floats, qf) != total_floats) {
-        fclose(qf); remove(qfile); return -1;
-    }
-    fclose(qf);
-
-    char cmd[4096];
-    snprintf(cmd, sizeof(cmd),
-             "\"\"%s\" \"%s\" \"%s\" %d %d %d < \"%s\" > \"%s\" 2>nul\"",
-             py, helper_path, idx->index_path, k, n_frames, content_dim,
-             qfile, rfile);
-    fprintf(stderr, "[faiss-dbg] running: %s\n", cmd);
-
-    int rc = system(cmd);
-    remove(qfile);
-    if (rc != 0) {
-        fprintf(stderr, "[faiss-dbg] system rc=%d\n", rc);
-        remove(rfile);
-        return -1;
-    }
-
-    FILE *pipe = fopen(rfile, "rb");
-    if (!pipe) {
-        fprintf(stderr, "[faiss-dbg] no result file %s\n", rfile);
-        return -1;
-    }
-
-    /* Read response: 1 byte ok flag */
-    unsigned char ok = 0;
-    if (fread(&ok, 1, 1, pipe) != 1) {
-        fclose(pipe); remove(rfile);
-        return -1;
-    }
-
-    if (!ok) {
-        /* Read error message: 4-byte length + string */
-        int err_len = 0;
-        fread(&err_len, 4, 1, pipe);
-        char errbuf[512];
-        fread(errbuf, 1, err_len < (int)sizeof(errbuf) ? err_len : sizeof(errbuf), pipe);
-        fprintf(stderr, "[rvc] faiss subprocess error: %.*s\n",
-                err_len < (int)sizeof(errbuf) ? err_len : (int)sizeof(errbuf), errbuf);
-        fclose(pipe); remove(rfile);
-        return -1;
-    }
-
-    /* Read auto_index_rate (1 float) */
-    if (fread(out_auto_rate, sizeof(float), 1, pipe) != 1) {
-        fclose(pipe); remove(rfile);
-        return -1;
-    }
-
-    /* Read neighbor vectors: n_frames * k * content_dim floats */
-    size_t n_vec_floats = (size_t)n_frames * k * content_dim;
-    if (fread(out_vectors, sizeof(float), n_vec_floats, pipe) != n_vec_floats) {
-        fclose(pipe); remove(rfile);
-        return -1;
-    }
-
-    /* Read distances: n_frames * k floats */
-    size_t n_dist_floats = (size_t)n_frames * k;
-    if (fread(out_distances, sizeof(float), n_dist_floats, pipe) != n_dist_floats) {
-        fclose(pipe); remove(rfile);
-        return -1;
-    }
-
-    fclose(pipe);
-    remove(rfile);
-    return 0;
-}
-
 /* ── Full RVC synthesis pipeline ──
  * content → retrieval → flow posterior → generator → vocoder */
 int wubu_rvc_retrieve_blend(const WuBuRVCModel *model,
@@ -804,29 +666,35 @@ int wubu_rvc_retrieve_blend(const WuBuRVCModel *model,
     float auto_index_rate = -1.0f;  /* auto-detected from IVF search */
 
     if (model->n_index_vectors > 0 && model->faiss_idx &&
-        model->faiss_idx->needs_subprocess) {
-        /* IVF index: search via Python+faiss subprocess (C11 can't parse
-         * the FAISS C++ binary format). The helper returns neighbor
-         * vectors + distances directly. */
+        model->faiss_idx->native_ivf) {
+        /* Native IVF index: exact search via wubu_ivf (no Python).
+         * wubu_ivf_search_vectors fills retrieved_vecs with the k nearest
+         * neighbor vectors (gathered by global id) + squared-L2 dists. */
         size_t n_vec_floats = (size_t)n_frames * k * content_dim;
         size_t n_dist_floats = (size_t)n_frames * k;
         retrieved_vecs = (float *)malloc(n_vec_floats * sizeof(float));
-        if (!retrieved_vecs) { free(retrieved_idx); free(retrieved_dist); return -1; }
-
-        int rc = wubu_faiss_search_subprocess(model->faiss_idx,
-                                               content_feats, n_frames,
-                                               content_dim, k,
-                                               &auto_index_rate,
-                                               retrieved_vecs, retrieved_dist);
-        if (rc == 0) {
-            /* Set retrieved_idx to sequential IDs for the blending loop
-             * (the blending uses retrieved_vecs directly, not index lookup).
-             * Mark all as valid. */
-            for (int f = 0; f < n_frames; f++)
-                for (int i = 0; i < k; i++)
-                    retrieved_idx[(size_t)f * k + i] = i;  /* placeholder */
-            have_retrieval = 1;
+        float *dists = (float *)malloc(n_dist_floats * sizeof(float));
+        if (!retrieved_vecs || !dists) {
+            free(retrieved_vecs); free(dists);
+            free(retrieved_idx); free(retrieved_dist); return -1;
         }
+
+        if (wubu_ivf_search_vectors(model->faiss_idx->native_ivf,
+                                    content_feats, n_frames, k,
+                                    retrieved_vecs, dists) == 0) {
+            have_retrieval = 1;
+            for (int f = 0; f < n_frames; f++)
+                for (int i = 0; i < k; i++) {
+                    /* ids not returned by this API; mark all valid —
+                     * weights use the squared distances only */
+                    retrieved_idx[(size_t)f * k + i] = 0;
+                    retrieved_dist[(size_t)f * k + i] = dists[(size_t)f * k + i];
+                }
+            /* auto_index_rate: keep the user-provided rate for IVF
+             * (native path has no cosine calibration yet) */
+            auto_index_rate = index_rate;
+        }
+        free(dists);
     } else if (model->n_index_vectors > 0 && model->retrieval_vectors) {
         /* Flat/WUBU index: brute-force k-NN search in memory */
         WuBuFaissIndex fake_idx;
@@ -915,8 +783,14 @@ int wubu_rvc_synthesize_full(WuBuRVCModel *model,
     int hidden = model->hidden_channels > 0 ? model->hidden_channels : 256;
 
     /* 1. Top-k retrieval (if index loaded) — REAL FAISS search against the
-     * training-set vectors. For IVF indexes, uses Python+faiss subprocess. */
-    int k = 1; /* only the top-1 neighbor is used by the blend below */
+     * training-set vectors. For IVF indexes, uses native wubu_ivf search. */
+    int k = 8; /* k=8 matches the ORIGINAL RVC pipeline.py:
+                *   score, ix = index.search(npy, k=8)
+                *   weight = np.square(1/score); weight /= weight.sum(axis=1)
+                *   npy = np.sum(index_vectors[ix] * weight[...,None], axis=1)
+                *   feats = npy * index_rate + (1 - index_rate) * feats
+                * k=1 was simpler but NOT what the reference does — the
+                * weighted 8-neighbor average is smoother. */
     int *retrieved_idx = (int *)calloc((size_t)k * n_frames, sizeof(int));
     float *retrieved_dist = (float *)calloc((size_t)k * n_frames, sizeof(float));
     float *retrieved_vecs = NULL;
@@ -924,18 +798,34 @@ int wubu_rvc_synthesize_full(WuBuRVCModel *model,
     float auto_index_rate = -1.0f;
 
     if (model->n_index_vectors > 0 && model->faiss_idx &&
-        model->faiss_idx->needs_subprocess) {
-        /* IVF index: search via Python+faiss subprocess */
+        model->faiss_idx->native_ivf) {
+        /* Native IVF index: exact search via wubu_ivf (no Python).
+         * wubu_ivf_search_vectors fills retrieved_vecs with the k nearest
+         * neighbor vectors (gathered by global id) + squared-L2 dists. */
         size_t n_vec_floats = (size_t)n_frames * k * content_dim;
+        size_t n_dist_floats = (size_t)n_frames * k;
         retrieved_vecs = (float *)malloc(n_vec_floats * sizeof(float));
-        if (retrieved_vecs) {
-            int rc = wubu_faiss_search_subprocess(model->faiss_idx,
-                                                    content_feats, n_frames,
-                                                    content_dim, k,
-                                                    &auto_index_rate,
-                                                    retrieved_vecs, retrieved_dist);
-            if (rc == 0) have_retrieval = 1;
+        float *dists = (float *)malloc(n_dist_floats * sizeof(float));
+        if (!retrieved_vecs || !dists) {
+            free(retrieved_vecs); free(dists);
+            free(retrieved_idx); free(retrieved_dist); return -1;
         }
+
+        if (wubu_ivf_search_vectors(model->faiss_idx->native_ivf,
+                                    content_feats, n_frames, k,
+                                    retrieved_vecs, dists) == 0) {
+            have_retrieval = 1;
+            for (int f = 0; f < n_frames; f++)
+                for (int i = 0; i < k; i++) {
+                    /* ids not returned by this API; mark all valid —
+                     * weights use the squared distances only */
+                    retrieved_idx[(size_t)f * k + i] = 0;
+                    retrieved_dist[(size_t)f * k + i] = dists[(size_t)f * k + i];
+                }
+            /* auto_index_rate: keep the user-provided rate for IVF */
+            auto_index_rate = -1.0f;
+        }
+        free(dists);
     } else if (model->n_index_vectors > 0 && model->retrieval_vectors) {
         WuBuFaissIndex fake_idx;
         fake_idx.d = model->index_dim > 0 ? model->index_dim : content_dim;
@@ -955,9 +845,10 @@ int wubu_rvc_synthesize_full(WuBuRVCModel *model,
     }
 
     /* 2. Blend content with retrieved (retrieval ratio = index_rate).
-     * For IVF (subprocess): retrieved_vecs holds the neighbor vectors.
+     * For IVF (native): retrieved_vecs holds the neighbor vectors
+     *   ([n_frames * k * content_dim], gathered from the index).
      * For flat index: model->retrieval_vectors holds all vectors.
-     * Auto-index-rate: when the IVF subprocess returned an auto_rate,
+     * Auto-index-rate: when the IVF search returned an auto_rate,
      * use it instead of the hardcoded 0.78. */
     float effective_rate = 0.78f;
     if (have_retrieval && auto_index_rate >= 0.0f)
@@ -970,12 +861,29 @@ int wubu_rvc_synthesize_full(WuBuRVCModel *model,
     }
 
     for (int f = 0; f < n_frames; f++) {
+        /* squared-inverse-distance weights over the k neighbors (RVC-exact) */
+        float wsum = 0.0f;
+        float w[8];
+        int valid[8];
+        for (int i = 0; i < k; i++) {
+            float d = retrieved_dist[(size_t)f * k + i];
+            if (d < 0.0f) d = 0.0f;
+            float wv = 1.0f / (d * d + 1e-12f);
+            w[i] = wv; wsum += wv;
+            valid[i] = (retrieved_idx[(size_t)f * k + i] >= 0) ? 1 : 0;
+        }
+        if (wsum <= 0.0f) wsum = 1.0f;
         for (int d = 0; d < content_dim; d++) {
             float orig = content_feats[(size_t)f * content_dim + d];
             float retr = orig;
             if (retrieved_vecs) {
-                /* IVF: vectors returned directly by subprocess */
-                retr = retrieved_vecs[(size_t)f * content_dim + d];
+                /* IVF: weighted 8-neighbor average */
+                retr = 0.0f;
+                for (int i = 0; i < k; i++) {
+                    if (!valid[i]) continue;
+                    retr += (w[i] / wsum) *
+                        retrieved_vecs[(size_t)((size_t)f * k + i) * content_dim + d];
+                }
             } else if (model->retrieval_vectors && have_retrieval &&
                        retrieved_idx[(size_t)f * k] >= 0) {
                 int rid = retrieved_idx[(size_t)f * k];
@@ -1212,19 +1120,20 @@ int wubu_rvc_load_index(WuBuRVCModel *model, const char *index_path) {
     model->n_index_vectors = idx->nb;
     model->index_dim = idx->d;
 
-    /* For IVF indexes (needs_subprocess=1), don't copy garbage vectors —
-     * the search will be done via Python+faiss subprocess.
-     * For flat/WUBU formats (needs_subprocess=0), copy the vectors directly. */
-    if (!idx->needs_subprocess && idx->vectors) {
+    /* For IVF indexes (native_ivf != NULL), vectors are NOT copied to RAM —
+     * the search + gather happens on-demand via wubu_ivf during retrieval.
+     * For flat/WUBU formats (native_ivf == NULL, vectors != NULL), copy
+     * them directly into the model for the brute-force path. */
+    if (idx->native_ivf) {
+        printf("[0] index: %s (IVF %d-dim, %lld vectors — native C11 search)\n",
+               index_path, idx->d, (long long)idx->nb);
+    } else if (idx->vectors) {
         model->retrieval_vectors = (float *)malloc(
             (size_t)idx->nb * idx->d * sizeof(float));
         if (model->retrieval_vectors) {
             memcpy(model->retrieval_vectors, idx->vectors,
                    (size_t)idx->nb * idx->d * sizeof(float));
         }
-    } else if (idx->needs_subprocess) {
-        printf("[0] index: %s (IVF %d-dim, %d vectors — subprocess search)\n",
-               index_path, idx->d, idx->nb);
     }
 
     /* Don't free idx here — it's owned by model->faiss_idx */

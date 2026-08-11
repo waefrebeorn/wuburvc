@@ -99,6 +99,7 @@ fi
 log "step 4/5: linking ${TARGET}.exe (gcc $ARCH)"
 export TMP="$(pwd)/build/tmp" TEMP="$(pwd)/build/tmp" TMPDIR="$(pwd)/build/tmp"
 "$GCC" -std=c11 -O3 -fopenmp -pthread -I src $ARCH \
+    -DWUBU_LINK_CUDA \
     src/wubu_rvc_cli.c $RVC_SRCS build/wubu_rvc_cuda.o \
     -lm "$CUDART" "$VULKAN_LNK" -o "build/${TARGET}.exe"
 log "linked: $(ls -la build/${TARGET}.exe | awk '{print $5}') bytes"

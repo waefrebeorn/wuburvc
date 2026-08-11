@@ -488,9 +488,12 @@ int wubu_content_mind_meld(const WuBuHuBERT *hubert,
     return n_frames;
 }
 
-/* ── FAISS .index parser ──
- * Binary layout: magic (4 bytes), dim (int32), nb (int64 or int32),
- *                nlist (int32), centroids, then vectors.
+/* ── FAISS .index loader ──
+ * Detects FAISS ivector (IwFl) vs flat formats. For IVF indexes,
+ * the binary layout is too complex C++ for reliable in-memory parsing,
+ * so we store the on-disk path and defer search to the Python faiss
+ * helper (wubu_faiss_search.py), which uses the real faiss library.
+ * For simple flat .fvecs/.npy formats, we load vectors directly.
  */
 WuBuFaissIndex *wubu_faiss_load(const char *path) {
     if (!path) return NULL;
@@ -504,52 +507,61 @@ WuBuFaissIndex *wubu_faiss_load(const char *path) {
     WuBuFaissIndex *idx = (WuBuFaissIndex *)calloc(1, sizeof(WuBuFaissIndex));
     if (!idx) { fclose(f); return NULL; }
 
-    int32_t d;
-    if (fread(&d, 4, 1, f) != 1) goto fail;
-    idx->d = d;
-
-    /* Try int64 for nb */
-    int64_t nb64;
-    if (fread(&nb64, 8, 1, f) != 1) goto fail;
-    /* Sanity check — if too big, try int32 */
-    if (nb64 <= 0 || nb64 > 100000000) {
-        fseek(f, -4, SEEK_CUR);
-        int32_t nb32;
-        if (fread(&nb32, 4, 1, f) != 1) goto fail;
-        nb64 = nb32;
-    }
-    idx->nb = (int)nb64;
-
-    /* nlist */
-    if (fread(&idx->nlist, 4, 1, f) != 1) goto fail;
-    if (idx->nlist <= 0 || idx->nlist > 1000000) {
-        idx->nlist = 1;  /* flat index */
-    }
-
-    /* Centroids */
-    idx->centroids = (float *)malloc((size_t)idx->nlist * idx->d * sizeof(float));
-    if (idx->centroids) {
-        if (fread(idx->centroids, sizeof(float),
-                  (size_t)idx->nlist * idx->d, f) == 0) {
-            /* Not enough data — continue with empty centroids */
+    /* FAISS serialized format: magic "IwFl" (0x4977466c) for IVF indexes */
+    if (memcmp(magic, "IwFl", 4) == 0) {
+        /* Real FAISS IndexIVFFlat — defer search to Python faiss helper.
+         * Read d and nb from the header for validation, but don't try to
+         * parse the complex IVF binary structure in C11. */
+        int32_t d;
+        if (fread(&d, 4, 1, f) != 1) goto fail;
+        int64_t nb64;
+        if (fread(&nb64, 8, 1, f) != 1) goto fail;
+        if (nb64 <= 0 || nb64 > 100000000) {
+            fseek(f, -4, SEEK_CUR);
+            int32_t nb32;
+            if (fread(&nb32, 4, 1, f) != 1) goto fail;
+            nb64 = nb32;
         }
+        idx->d = d;
+        idx->nb = (int)nb64;
+        idx->nlist = 1;           /* unknown for IVF — handled by Python */
+        idx->needs_subprocess = 1; /* use Python faiss helper for search */
+        /* Save the on-disk path for the subprocess */
+        strncpy(idx->index_path, path, sizeof(idx->index_path) - 1);
+        fclose(f);
+        return idx;
     }
 
-    /* Vectors (id + data per vector) */
-    idx->vectors = (float *)malloc((size_t)idx->nb * idx->d * sizeof(float));
-    if (!idx->vectors && idx->nb > 0) goto fail;
+    /* WUBU flat-vector format: magic "WUBU" (4 bytes), d (int32),
+     * nb (int64), then nb * d raw float32 values (row-major). */
+    if (memcmp(magic, "WUBU", 4) == 0) {
+        int32_t d;
+        if (fread(&d, 4, 1, f) != 1) goto fail;
+        idx->d = d;
 
-    for (int64_t i = 0; i < nb64; i++) {
-        int32_t id;
-        if (fread(&id, 4, 1, f) != 1) break;
-        if (fread(&idx->vectors[i * idx->d], sizeof(float),
-                  (size_t)idx->d, f) != (size_t)idx->d) break;
-        (void)id;  /* vector index is i */
+        int64_t nb64;
+        if (fread(&nb64, 8, 1, f) != 1) goto fail;
+        if (nb64 <= 0 || nb64 > 100000000) goto fail;
+        idx->nb = (int)nb64;
+
+        idx->nlist = 0;  /* flat index — no IVF structure */
+        idx->needs_subprocess = 0;  /* vectors already in memory */
+
+        /* Load all vectors directly (simple flat binary) */
+        idx->vectors = (float *)malloc((size_t)idx->nb * idx->d * sizeof(float));
+        if (!idx->vectors && idx->nb > 0) goto fail;
+
+        if (fread(idx->vectors, sizeof(float),
+                  (size_t)idx->nb * idx->d, f) != (size_t)idx->nb * idx->d) {
+            /* Partial read — use what we got */
+        }
+        idx->nprobe = 1;
+        fclose(f);
+        return idx;
     }
 
-    idx->nprobe = 1;
-    fclose(f);
-    return idx;
+    /* Unknown format — reject */
+    goto fail;
 
 fail:
     wubu_faiss_free(idx);
@@ -620,6 +632,153 @@ int wubu_faiss_search(const WuBuFaissIndex *idx,
     return 0;
 }
 
+/* ── IVF FAISS subprocess search ──
+ * Calls Python+faiss (wubu_faiss_search.py) to search a real FAISS
+ * IndexIVFFlat. The C11 cannot parse FAISS's serialized C++ format,
+ * so the real faiss library does the search and returns neighbor
+ * vectors + distances as raw float32 bytes.
+ *
+ * Returns 0 on success, -1 on failure. */
+static int wubu_faiss_search_subprocess(const WuBuFaissIndex *idx,
+                                        const float *content_feats,
+                                        int n_frames, int content_dim, int k,
+                                        float *out_auto_rate,
+                                        float *out_vectors,
+                                        float *out_distances) {
+    if (!idx || !idx->index_path[0] || !content_feats || !out_vectors)
+        return -1;
+
+    /* Locate the Python helper script (wubu_faiss_search.py). */
+    char helper_path[2048];
+
+    /* Try relative to the executable's directory */
+    const char *exe_hint = getenv("WUBU_RVC_PYHELP");
+    if (exe_hint && exe_hint[0]) {
+        snprintf(helper_path, sizeof(helper_path), "%s", exe_hint);
+    } else {
+        /* Try several candidate paths for the helper script */
+        const char *candidates[] = {
+            "C:/Users/eman5/wuburvc/src/wubu_faiss_search.py",
+            "../wuburvc/src/wubu_faiss_search.py",
+            "src/wubu_faiss_search.py",
+            "/c/Users/eman5/wuburvc/src/wubu_faiss_search.py",
+            NULL
+        };
+        helper_path[0] = 0;
+        for (int i = 0; candidates[i]; i++) {
+            FILE *tf = fopen(candidates[i], "rb");
+            if (tf) { fclose(tf);
+                strncpy(helper_path, candidates[i], sizeof(helper_path) - 1);
+                break;
+            }
+        }
+        if (!helper_path[0]) {
+            strncpy(helper_path, "wubu_faiss_search.py", sizeof(helper_path) - 1);
+        }
+    }
+
+    /* Build the command: python wubu_faiss_search.py <index> <k> <nf> <dim> */
+    const char *py = getenv("WUBU_PYTHON");
+    if (!py) py = "python";
+
+    fprintf(stderr, "[faiss-dbg] helper=%s py=%s index=%s k=%d nf=%d dim=%d\n",
+            helper_path, py, idx->index_path, k, n_frames, content_dim);
+
+    /* ── Windows popen cannot do bidirectional "w+b" ──────────────────────
+     * MSVCRT _popen only supports "r"/"w"/"rb"/"wb" (verified: "w+b"
+     * returns NULL). The old code wrote queries then read the answer over
+     * one pipe, which NEVER WORKED on Windows: the subprocess was never
+     * spawned, retrieval was silently disabled (ratio 0) — "works better
+     * without the index than with it" because with == without.
+     * Fix: write queries to a temp file, redirect the helper's stdout to a
+     * result file, run via system() (the canonical cmd.exe /c pattern for
+     * multiple quoted args — see system-bridge-rc1-fix), then read the
+     * result file back. Temp names are unique per call so the jobs=4 chunk
+     * workers don't clobber each other. */
+    static int g_faiss_seq = 0;
+    int seq = __sync_fetch_and_add(&g_faiss_seq, 1);
+    char qfile[1024], rfile[1024];
+    const char *tmp = getenv("TEMP");
+    if (!tmp || !tmp[0]) tmp = ".";
+    snprintf(qfile, sizeof(qfile), "%s/faiss_q_%d.bin", tmp, seq);
+    snprintf(rfile, sizeof(rfile), "%s/faiss_r_%d.bin", tmp, seq);
+
+    size_t total_floats = (size_t)n_frames * content_dim;
+    FILE *qf = fopen(qfile, "wb");
+    if (!qf) {
+        fprintf(stderr, "[faiss-dbg] cannot create %s\n", qfile);
+        return -1;
+    }
+    if (fwrite(content_feats, sizeof(float), total_floats, qf) != total_floats) {
+        fclose(qf); remove(qfile); return -1;
+    }
+    fclose(qf);
+
+    char cmd[4096];
+    snprintf(cmd, sizeof(cmd),
+             "\"\"%s\" \"%s\" \"%s\" %d %d %d < \"%s\" > \"%s\" 2>nul\"",
+             py, helper_path, idx->index_path, k, n_frames, content_dim,
+             qfile, rfile);
+    fprintf(stderr, "[faiss-dbg] running: %s\n", cmd);
+
+    int rc = system(cmd);
+    remove(qfile);
+    if (rc != 0) {
+        fprintf(stderr, "[faiss-dbg] system rc=%d\n", rc);
+        remove(rfile);
+        return -1;
+    }
+
+    FILE *pipe = fopen(rfile, "rb");
+    if (!pipe) {
+        fprintf(stderr, "[faiss-dbg] no result file %s\n", rfile);
+        return -1;
+    }
+
+    /* Read response: 1 byte ok flag */
+    unsigned char ok = 0;
+    if (fread(&ok, 1, 1, pipe) != 1) {
+        fclose(pipe); remove(rfile);
+        return -1;
+    }
+
+    if (!ok) {
+        /* Read error message: 4-byte length + string */
+        int err_len = 0;
+        fread(&err_len, 4, 1, pipe);
+        char errbuf[512];
+        fread(errbuf, 1, err_len < (int)sizeof(errbuf) ? err_len : sizeof(errbuf), pipe);
+        fprintf(stderr, "[rvc] faiss subprocess error: %.*s\n",
+                err_len < (int)sizeof(errbuf) ? err_len : (int)sizeof(errbuf), errbuf);
+        fclose(pipe); remove(rfile);
+        return -1;
+    }
+
+    /* Read auto_index_rate (1 float) */
+    if (fread(out_auto_rate, sizeof(float), 1, pipe) != 1) {
+        fclose(pipe); remove(rfile);
+        return -1;
+    }
+
+    /* Read neighbor vectors: n_frames * k * content_dim floats */
+    size_t n_vec_floats = (size_t)n_frames * k * content_dim;
+    if (fread(out_vectors, sizeof(float), n_vec_floats, pipe) != n_vec_floats) {
+        fclose(pipe); remove(rfile);
+        return -1;
+    }
+
+    /* Read distances: n_frames * k floats */
+    size_t n_dist_floats = (size_t)n_frames * k;
+    if (fread(out_distances, sizeof(float), n_dist_floats, pipe) != n_dist_floats) {
+        fclose(pipe); remove(rfile);
+        return -1;
+    }
+
+    fclose(pipe);
+    remove(rfile);
+    return 0;
+}
+
 /* ── Full RVC synthesis pipeline ──
  * content → retrieval → flow posterior → generator → vocoder */
 int wubu_rvc_retrieve_blend(const WuBuRVCModel *model,
@@ -640,17 +799,42 @@ int wubu_rvc_retrieve_blend(const WuBuRVCModel *model,
     const int k = 8;
     int *retrieved_idx = (int *)calloc((size_t)k * n_frames, sizeof(int));
     float *retrieved_dist = (float *)calloc((size_t)k * n_frames, sizeof(float));
+    float *retrieved_vecs = NULL;  /* [n_frames * k * content_dim] for IVF subprocess */
     int have_retrieval = 0;
+    float auto_index_rate = -1.0f;  /* auto-detected from IVF search */
 
-    if (model->n_index_vectors > 0 && model->retrieval_vectors) {
+    if (model->n_index_vectors > 0 && model->faiss_idx &&
+        model->faiss_idx->needs_subprocess) {
+        /* IVF index: search via Python+faiss subprocess (C11 can't parse
+         * the FAISS C++ binary format). The helper returns neighbor
+         * vectors + distances directly. */
+        size_t n_vec_floats = (size_t)n_frames * k * content_dim;
+        size_t n_dist_floats = (size_t)n_frames * k;
+        retrieved_vecs = (float *)malloc(n_vec_floats * sizeof(float));
+        if (!retrieved_vecs) { free(retrieved_idx); free(retrieved_dist); return -1; }
+
+        int rc = wubu_faiss_search_subprocess(model->faiss_idx,
+                                               content_feats, n_frames,
+                                               content_dim, k,
+                                               &auto_index_rate,
+                                               retrieved_vecs, retrieved_dist);
+        if (rc == 0) {
+            /* Set retrieved_idx to sequential IDs for the blending loop
+             * (the blending uses retrieved_vecs directly, not index lookup).
+             * Mark all as valid. */
+            for (int f = 0; f < n_frames; f++)
+                for (int i = 0; i < k; i++)
+                    retrieved_idx[(size_t)f * k + i] = i;  /* placeholder */
+            have_retrieval = 1;
+        }
+    } else if (model->n_index_vectors > 0 && model->retrieval_vectors) {
+        /* Flat/WUBU index: brute-force k-NN search in memory */
         WuBuFaissIndex fake_idx;
         fake_idx.d = model->index_dim > 0 ? model->index_dim : content_dim;
         fake_idx.nb = model->n_index_vectors;
         fake_idx.vectors = model->retrieval_vectors;
-        /* each frame's search is independent — parallel over frames (the
-         * brute-force scan is the dominant cost on long audio) */
         int found = 0;
-#pragma omp parallel for schedule(static) if(n_frames >= 32) reduction(+:found)
+# pragma omp parallel for schedule(static) if(n_frames >= 32) reduction(+:found)
         for (int f = 0; f < n_frames; f++) {
             if (wubu_faiss_search(&fake_idx, &content_feats[(size_t)f * content_dim],
                                   fake_idx.d, k,
@@ -662,30 +846,50 @@ int wubu_rvc_retrieve_blend(const WuBuRVCModel *model,
     }
 
     /* Blend content with retrieved (retrieval ratio = index_rate).
-     * Honest: only blend when the FAISS index actually returned real
-     * training-set neighbors. Without an index, ratio drops to 0. */
-    float retrieval_ratio = have_retrieval ? index_rate : 0.0f;
+     * For IVF (subprocess): retrieved_vecs holds the neighbor vectors.
+     * For flat index: model->retrieval_vectors holds all vectors,
+     *   retrieved_idx maps frame×k → vector ID.
+     * Auto-index-rate: when the IVF subprocess returned an auto_rate,
+     * use it instead of the manually specified index_rate. This is the
+     * "magical" auto-detection — the rate adapts to how well the index
+     * matches the source content. */
+    float effective_rate = index_rate;
+    if (have_retrieval && auto_index_rate >= 0.0f)
+        effective_rate = auto_index_rate;
+    if (have_retrieval)
+        fprintf(stderr, "[faiss] blend: auto_rate=%.3f effective=%.3f\n",
+                auto_index_rate, effective_rate);
+    float retrieval_ratio = have_retrieval ? effective_rate : 0.0f;
     for (int f = 0; f < n_frames; f++) {
         /* squared-inverse-distance weights over the k neighbors */
         float wsum = 0.0f;
         float w[8];
         int valid[8] = {0,0,0,0,0,0,0,0};
         for (int i = 0; i < k; i++) {
-            int rid = retrieved_idx[(size_t)f * k + i];
-            if (have_retrieval && rid >= 0 && rid < model->n_index_vectors) {
-                float d = retrieved_dist[(size_t)f * k + i];
-                float wv = 1.0f / (d * d + 1e-12f);
-                w[i] = wv; wsum += wv; valid[i] = 1;
-            }
+            float d = retrieved_dist[(size_t)f * k + i];
+            if (d < 0.0f) d = 0.0f;  /* faiss can return -1 for invalid */
+            float wv = 1.0f / (d * d + 1e-12f);
+            w[i] = wv; wsum += wv; valid[i] = 1;
         }
         if (wsum <= 0.0f) wsum = 1.0f;
         for (int d = 0; d < content_dim; d++) {
             float orig = content_feats[(size_t)f * content_dim + d];
             float retr = 0.0f;
-            for (int i = 0; i < k; i++) {
-                if (!valid[i]) continue;
-                int rid = retrieved_idx[(size_t)f * k + i];
-                retr += (w[i] / wsum) * model->retrieval_vectors[(size_t)rid * content_dim + d];
+            if (retrieved_vecs) {
+                /* IVF: vectors returned directly by subprocess */
+                for (int i = 0; i < k; i++) {
+                    if (!valid[i]) continue;
+                    retr += (w[i] / wsum) *
+                        retrieved_vecs[(size_t)((size_t)f * k + i) * content_dim + d];
+                }
+            } else if (model->retrieval_vectors) {
+                /* Flat: look up by ID */
+                for (int i = 0; i < k; i++) {
+                    if (!valid[i]) continue;
+                    int rid = retrieved_idx[(size_t)f * k + i];
+                    if (rid >= 0 && rid < model->n_index_vectors)
+                        retr += (w[i] / wsum) * model->retrieval_vectors[(size_t)rid * content_dim + d];
+                }
             }
             if (!have_retrieval) retr = orig;
             out[(size_t)f * content_dim + d] =
@@ -694,6 +898,7 @@ int wubu_rvc_retrieve_blend(const WuBuRVCModel *model,
     }
     free(retrieved_idx);
     free(retrieved_dist);
+    free(retrieved_vecs);
     return 0;
 }
 
@@ -710,20 +915,33 @@ int wubu_rvc_synthesize_full(WuBuRVCModel *model,
     int hidden = model->hidden_channels > 0 ? model->hidden_channels : 256;
 
     /* 1. Top-k retrieval (if index loaded) — REAL FAISS search against the
-     * training-set vectors. No self-blend: if no index is loaded, retrieval
-     * is skipped entirely (ratio 0), never the query blended with itself. */
+     * training-set vectors. For IVF indexes, uses Python+faiss subprocess. */
     int k = 1; /* only the top-1 neighbor is used by the blend below */
     int *retrieved_idx = (int *)calloc((size_t)k * n_frames, sizeof(int));
     float *retrieved_dist = (float *)calloc((size_t)k * n_frames, sizeof(float));
+    float *retrieved_vecs = NULL;
     int have_retrieval = 0;
+    float auto_index_rate = -1.0f;
 
-    if (model->n_index_vectors > 0 && model->retrieval_vectors) {
+    if (model->n_index_vectors > 0 && model->faiss_idx &&
+        model->faiss_idx->needs_subprocess) {
+        /* IVF index: search via Python+faiss subprocess */
+        size_t n_vec_floats = (size_t)n_frames * k * content_dim;
+        retrieved_vecs = (float *)malloc(n_vec_floats * sizeof(float));
+        if (retrieved_vecs) {
+            int rc = wubu_faiss_search_subprocess(model->faiss_idx,
+                                                    content_feats, n_frames,
+                                                    content_dim, k,
+                                                    &auto_index_rate,
+                                                    retrieved_vecs, retrieved_dist);
+            if (rc == 0) have_retrieval = 1;
+        }
+    } else if (model->n_index_vectors > 0 && model->retrieval_vectors) {
         WuBuFaissIndex fake_idx;
         fake_idx.d = model->index_dim > 0 ? model->index_dim : content_dim;
         fake_idx.nb = model->n_index_vectors;
         fake_idx.vectors = model->retrieval_vectors;
-        /* each frame's search is independent — parallel over frames (the
-         * brute-force scan is the dominant cost on long audio) */
+        /* each frame's search is independent */
         int found = 0;
 #pragma omp parallel for schedule(static) if(n_frames >= 32) reduction(+:found)
         for (int f = 0; f < n_frames; f++) {
@@ -736,26 +954,30 @@ int wubu_rvc_synthesize_full(WuBuRVCModel *model,
         have_retrieval = found > 0;
     }
 
-    /* 2. Blend content with retrieved (retrieval ratio = 0.78).
-     * Honest: only blend when the FAISS index actually returned real
-     * training-set neighbors. Without an index, ratio drops to 0. */
-    float retrieval_ratio = have_retrieval ? 0.78f : 0.0f;
+    /* 2. Blend content with retrieved (retrieval ratio = index_rate).
+     * For IVF (subprocess): retrieved_vecs holds the neighbor vectors.
+     * For flat index: model->retrieval_vectors holds all vectors.
+     * Auto-index-rate: when the IVF subprocess returned an auto_rate,
+     * use it instead of the hardcoded 0.78. */
+    float effective_rate = 0.78f;
+    if (have_retrieval && auto_index_rate >= 0.0f)
+        effective_rate = auto_index_rate;
+    float retrieval_ratio = have_retrieval ? effective_rate : 0.0f;
     float *blended = (float *)calloc((size_t)n_frames * content_dim, sizeof(float));
     if (!blended) {
-        free(retrieved_idx); free(retrieved_dist);
+        free(retrieved_idx); free(retrieved_dist); free(retrieved_vecs);
         return -1;
     }
 
     for (int f = 0; f < n_frames; f++) {
         for (int d = 0; d < content_dim; d++) {
             float orig = content_feats[(size_t)f * content_dim + d];
-            /* Real neighbors only — never the query itself. The FAISS
-             * search returns training-set vectors; a self-hit would have
-             * distance 0 and is excluded by taking the 2nd..kth when the
-             * first is the query itself (the RVC index excludes the query
-             * by construction of the training set). */
             float retr = orig;
-            if (have_retrieval && retrieved_idx[(size_t)f * k] >= 0) {
+            if (retrieved_vecs) {
+                /* IVF: vectors returned directly by subprocess */
+                retr = retrieved_vecs[(size_t)f * content_dim + d];
+            } else if (model->retrieval_vectors && have_retrieval &&
+                       retrieved_idx[(size_t)f * k] >= 0) {
                 int rid = retrieved_idx[(size_t)f * k];
                 if (rid >= 0 && rid < model->n_index_vectors)
                     retr = model->retrieval_vectors[(size_t)rid * content_dim + d];
@@ -768,7 +990,7 @@ int wubu_rvc_synthesize_full(WuBuRVCModel *model,
     /* 3. Flow posterior (Glow: 4 coupling layers) */
     float *flow_state = (float *)calloc((size_t)n_frames * hidden, sizeof(float));
     if (!flow_state) {
-        free(retrieved_idx); free(retrieved_dist); free(blended);
+        free(retrieved_idx); free(retrieved_dist); free(blended); free(retrieved_vecs);
         return -1;
     }
 
@@ -811,6 +1033,7 @@ int wubu_rvc_synthesize_full(WuBuRVCModel *model,
 
     free(retrieved_idx);
     free(retrieved_dist);
+    free(retrieved_vecs);
     free(blended);
     free(flow_state);
     return out_samples;
@@ -977,22 +1200,34 @@ WuBuRVCModel *wubu_rvc_load_model(const char *pth_path) {
 
 /* ── FAISS index loading ── */
 int wubu_rvc_load_index(WuBuRVCModel *model, const char *index_path) {
-    if (!model || !index_path) return -1;
+    if (!model || !index_path || !*index_path) return -1;
 
     WuBuFaissIndex *idx = wubu_faiss_load(index_path);
     if (!idx) return -1;
 
+    /* Save the on-disk path and index pointer for potential subprocess search */
+    strncpy(model->index_path, index_path, sizeof(model->index_path) - 1);
+    model->faiss_idx = idx;
+
     model->n_index_vectors = idx->nb;
     model->index_dim = idx->d;
 
-    model->retrieval_vectors = (float *)malloc(
-        (size_t)idx->nb * idx->d * sizeof(float));
-    if (model->retrieval_vectors) {
-        memcpy(model->retrieval_vectors, idx->vectors,
-               (size_t)idx->nb * idx->d * sizeof(float));
+    /* For IVF indexes (needs_subprocess=1), don't copy garbage vectors —
+     * the search will be done via Python+faiss subprocess.
+     * For flat/WUBU formats (needs_subprocess=0), copy the vectors directly. */
+    if (!idx->needs_subprocess && idx->vectors) {
+        model->retrieval_vectors = (float *)malloc(
+            (size_t)idx->nb * idx->d * sizeof(float));
+        if (model->retrieval_vectors) {
+            memcpy(model->retrieval_vectors, idx->vectors,
+                   (size_t)idx->nb * idx->d * sizeof(float));
+        }
+    } else if (idx->needs_subprocess) {
+        printf("[0] index: %s (IVF %d-dim, %d vectors — subprocess search)\n",
+               index_path, idx->d, idx->nb);
     }
 
-    wubu_faiss_free(idx);
+    /* Don't free idx here — it's owned by model->faiss_idx */
     return 0;
 }
 
@@ -1027,6 +1262,8 @@ void wubu_rvc_model_free(WuBuRVCModel *model) {
     free(model->weight_blob);
     free(model->retrieval_features);
     free(model->retrieval_vectors);
+    if (model->faiss_idx) wubu_faiss_free(model->faiss_idx);
+    model->faiss_idx = NULL;
     /* Free de-normalized weight arrays */
     for (int i = 0; i < 4; i++) {
         free(model->hifi_upsample_denorm[i]);

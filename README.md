@@ -10,6 +10,8 @@ flow (prior + posterior) → NSF vocoder**, plus a **full mastering suite** and 
 
 No Python at runtime. No torch. No "third party" — *we properly make it*.
 
+> **~WuBu~ AGI** — one system, many repositories. This is the **voice engine**. The Body is [WuBuOS](https://github.com/waefrebeorn/WuBuOS), the Brain wubuwizard, the Compiler WuBuNOS.
+
 ## Why it's amazing
 
 | Property | Value |
